@@ -14,6 +14,14 @@ pub trait Vst3Plugin: Plugin {
     /// truncated.
     const VST3_SUBCATEGORIES: &'static [Vst3SubCategory];
 
+    /// Whether `IAudioProcessor::getTailSamples()` always reports an infinite tail, instead of
+    /// the tail implied by the last [`ProcessStatus`][crate::prelude::ProcessStatus]. Hosts may
+    /// read the tail length only once when the plugin is activated, before the first `process()`
+    /// call, at which point the last status is `Normal` and the tail would be reported as 0. A
+    /// plugin with tails of unknown length (delay feedback, reverb) can set this so such hosts
+    /// keep processing it after its input has stopped.
+    const VST3_INFINITE_TAIL: bool = false;
+
     /// [`VST3_CLASS_ID`][Self::VST3_CLASS_ID`] in the correct order for the current platform so
     /// projects and presets can be shared between platforms. This should not be overridden.
     const PLATFORM_VST3_CLASS_ID: [u8; 16] = swap_vst3_uid_byte_order(Self::VST3_CLASS_ID);

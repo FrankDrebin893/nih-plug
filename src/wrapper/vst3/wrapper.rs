@@ -1672,6 +1672,9 @@ impl<P: Vst3Plugin> IAudioProcessor for Wrapper<P> {
 
     unsafe fn get_tail_samples(&self) -> u32 {
         // https://github.com/steinbergmedia/vst3_pluginterfaces/blob/2ad397ade5b51007860bedb3b01b8afd2c5f6fba/vst/ivstaudioprocessor.h#L145-L159
+        if P::VST3_INFINITE_TAIL {
+            return u32::MAX; // kInfiniteTail
+        }
         match self.inner.last_process_status.load() {
             ProcessStatus::Tail(samples) => samples,
             ProcessStatus::KeepAlive => u32::MAX, // kInfiniteTail
