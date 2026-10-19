@@ -12,8 +12,13 @@ use egui_baseview::EguiWindow;
 use nih_plug::prelude::{Editor, GuiContext, ParamSetter, ParentWindowHandle};
 use parking_lot::RwLock;
 use raw_window_handle::{HasRawWindowHandle, RawWindowHandle};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// For how many seconds after the window is opened every frame is painted. Most DAWs open their
+/// GUI while the window is still unmapped, and without this the GUI would stay blank until the
+/// first input or repaint request after it is mapped.
+const OPENING_REPAINT_SECS: f64 = 1.0;
 
 /// An [`Editor`] implementation that calls an egui draw loop.
 pub(crate) struct EguiEditor<T> {
@@ -29,6 +34,9 @@ pub(crate) struct EguiEditor<T> {
     /// The scaling factor reported by the host, if any. On macOS this will never be set and we
     /// should use the system scaling factor instead.
     pub(crate) scaling_factor: AtomicCell<Option<f32>>,
+
+    /// Set when the host changed a parameter's value or modulation, so the next frame is painted.
+    pub(crate) param_changed: Arc<AtomicBool>,
 }
 
 /// This version of `baseview` uses a different version of `raw_window_handle than NIH-plug, so we
@@ -70,6 +78,7 @@ where
         let update = self.update.clone();
         let state = self.user_state.clone();
         let egui_state = self.egui_state.clone();
+        let param_changed = self.param_changed.clone();
 
         let (unscaled_width, unscaled_height) = self.egui_state.size();
         let scaling_factor = self.scaling_factor.load();
@@ -123,12 +132,19 @@ where
                     }
                 }
 
-                // For now, just always redraw. Most plugin GUIs have meters, and those almost always
-                // need a redraw. Later we can try to be a bit more sophisticated about this. Without
-                // this we would also have a blank GUI when it gets first opened because most DAWs open
-                // their GUI while the window is still unmapped.
-                egui_ctx.request_repaint();
                 (update)(egui_ctx, &setter, &mut state.write());
+
+                // The update runs with every frame, but a frame is only painted when something asks
+                // for it: egui itself on input, the plugin with `request_repaint()` (meters and
+                // other things that change on their own), the host by changing a parameter, and
+                // the first frames after opening. Painting every frame costs a good part of a CPU
+                // core while nothing changes. The host's changes are looked at after the update,
+                // so a value it drew is painted in the same frame: egui-baseview drops the texture
+                // changes of a frame it does not paint, such as the glyphs of a new value.
+                let opening = egui_ctx.input(|input| input.time) < OPENING_REPAINT_SECS;
+                if param_changed.swap(false, Ordering::AcqRel) || opening {
+                    egui_ctx.request_repaint();
+                }
             },
         );
 
@@ -163,15 +179,15 @@ where
     }
 
     fn param_value_changed(&self, _id: &str, _normalized_value: f32) {
-        // As mentioned above, for now we'll always force a redraw to allow meter widgets to work
-        // correctly. In the future we can use an `Arc<AtomicBool>` and only force a redraw when
-        // that boolean is set.
+        self.param_changed.store(true, Ordering::Release);
     }
 
-    fn param_modulation_changed(&self, _id: &str, _modulation_offset: f32) {}
+    fn param_modulation_changed(&self, _id: &str, _modulation_offset: f32) {
+        self.param_changed.store(true, Ordering::Release);
+    }
 
     fn param_values_changed(&self) {
-        // Same
+        self.param_changed.store(true, Ordering::Release);
     }
 }
 

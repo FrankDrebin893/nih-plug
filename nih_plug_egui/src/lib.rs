@@ -50,6 +50,7 @@ where
         user_state: Arc::new(RwLock::new(user_state)),
         build: Arc::new(build),
         update: Arc::new(update),
+        param_changed: Arc::new(AtomicBool::new(false)),
 
         // TODO: We can't get the size of the window when baseview does its own scaling, so if the
         //       host does not set a scale factor on Windows or Linux we should just use a factor of
