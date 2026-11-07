@@ -505,6 +505,9 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         should_terminate: Arc<AtomicBool>,
         gui_task_sender: channel::Sender<GuiTask>,
     ) {
+        // The phase of the test tone (`nih_standalone_set_test_tone()`), in cycles
+        let mut tone_phase = 0.0f32;
+        let tone_step = 440.0 / self.buffer_config.sample_rate;
         self.clone().backend.borrow_mut().run(
             move |buffer, aux, transport, input_events, output_events| {
                 // TODO: This process wrapper should actually be in the backends (since the backends
@@ -533,6 +536,16 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                             );
 
                             return false;
+                        }
+                    }
+
+                    if super::nih_standalone_test_tone() {
+                        for channel_samples in buffer.iter_samples() {
+                            tone_phase = (tone_phase + tone_step).fract();
+                            let tone = (tone_phase * std::f32::consts::TAU).sin() * 0.1;
+                            for sample in channel_samples {
+                                *sample = tone;
+                            }
                         }
                     }
 

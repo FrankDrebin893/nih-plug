@@ -43,6 +43,16 @@ pub struct WrapperConfig {
     /// Specifying an empty string or other invalid value will list all available output devices.
     #[clap(value_parser, long)]
     pub output_device: Option<String>,
+    /// The first channel (counted from 1) of the input device the plugin's input is read from, for
+    /// the ALSA, CoreAudio, WASAPI and ASIO backends. With a plugin that takes two input channels
+    /// `3` reads channels 3 and 4 of the device. Defaults to the first channel.
+    #[clap(value_parser = clap::value_parser!(u32).range(1..), long, default_value = "1")]
+    pub input_channel: u32,
+    /// The first channel (counted from 1) of the output device the plugin's output is written to,
+    /// for the ALSA, CoreAudio, WASAPI and ASIO backends. The device's other channels are silent.
+    /// Defaults to the first channel.
+    #[clap(value_parser = clap::value_parser!(u32).range(1..), long, default_value = "1")]
+    pub output_channel: u32,
     /// The input MIDI device for the ALSA, CoreAudio, and WASAPI backends.
     ///
     /// Specifying an empty string or other invalid value will list all available MIDI inputs.
@@ -113,6 +123,10 @@ pub enum BackendType {
     /// Use WASAPI for audio and MIDI.
     #[cfg(target_os = "windows")]
     Wasapi,
+    /// Use ASIO for audio and low latency audio interfaces. Needs the `asio` feature, which
+    /// needs the Steinberg ASIO SDK at build time.
+    #[cfg(all(target_os = "windows", feature = "asio"))]
+    Asio,
     /// Does not playback or receive any audio or MIDI.
     Dummy,
 }

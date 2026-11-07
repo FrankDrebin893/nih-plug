@@ -130,8 +130,10 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
                 // Data is sent to the output data callback using a wait-free ring buffer
+                // Only the channels the plugin reads go through it
                 let (rb_producer, rb_consumer) = RingBuffer::new(
-                    self.output.config.channels as usize * self.config.period_size as usize,
+                    num_input_channels_of(&self.audio_io_layout).max(1)
+                        * self.config.period_size as usize,
                 );
                 input_rb_consumer = Some(rb_consumer);
 
@@ -150,7 +152,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         match $sample_format {
                             $($format => input.device.build_input_stream(
                                 &input.config,
-                                self.build_input_data_callback::<$primitive_type>(input_unparker, rb_producer),
+                                self.build_input_data_callback::<$primitive_type>(
+                                    input_unparker,
+                                    rb_producer,
+                                    input.config.channels as usize,
+                                ),
                                 error_cb,
                                 None,
                             ),)*
@@ -428,6 +434,9 @@ impl CpalMidir {
                 .context("No default audio output device available")?,
         };
 
+        // The channels are counted from 1 on the command line, from 0 here
+        let input_first_channel = config.input_channel.saturating_sub(1) as usize;
+        let output_first_channel = config.output_channel.saturating_sub(1) as usize;
         let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
         let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
         let num_input_channels = audio_io_layout
@@ -436,12 +445,12 @@ impl CpalMidir {
             .unwrap_or_default() as usize;
         let input = input_device
             .map(|device| -> Result<CpalDevice> {
-                let input_configs: Vec<_> = device
+                let mut input_configs: Vec<_> = device
                     .supported_input_configs()
                     .context("Could not get supported audio input configurations")?
                     .filter(|c| match c.buffer_size() {
                         cpal::SupportedBufferSize::Range { min, max } => {
-                            c.channels() as usize == num_input_channels
+                            c.channels() as usize >= input_first_channel + num_input_channels
                                 && (c.min_sample_rate()..=c.max_sample_rate())
                                     .contains(&requested_sample_rate)
                                 && (min..=max).contains(&&config.period_size)
@@ -449,17 +458,25 @@ impl CpalMidir {
                         cpal::SupportedBufferSize::Unknown => false,
                     })
                     .collect();
+                // The fewest channels that reach the chosen ones
+                input_configs.sort_by_key(|c| c.channels());
                 let input_config_range = input_configs
                     .iter()
                     // Prefer floating point samples to avoid conversions
-                    .find(|c| c.sample_format() == SampleFormat::F32)
+                    .find(|c| {
+                        c.sample_format() == SampleFormat::F32
+                            && c.channels() == input_configs[0].channels()
+                    })
                     .or_else(|| input_configs.first())
                     .cloned()
                     .with_context(|| {
                         format!(
-                            "The audio input device does not support {} audio channels at a \
-                             sample rate of {} Hz and a period size of {} samples",
-                            num_input_channels, config.sample_rate, config.period_size,
+                            "The audio input device does not have {} audio channels from \
+                             channel {} at a sample rate of {} Hz and a period size of {} samples",
+                            num_input_channels,
+                            config.input_channel,
+                            config.sample_rate,
+                            config.period_size,
                         )
                     })?;
 
@@ -484,12 +501,12 @@ impl CpalMidir {
             .map(NonZeroU32::get)
             .unwrap_or_default() as usize;
         let output = {
-            let output_configs: Vec<_> = output_device
+            let mut output_configs: Vec<_> = output_device
                 .supported_output_configs()
                 .context("Could not get supported audio output configurations")?
                 .filter(|c| match c.buffer_size() {
                     cpal::SupportedBufferSize::Range { min, max } => {
-                        c.channels() as usize == num_output_channels
+                        c.channels() as usize >= output_first_channel + num_output_channels
                             && (c.min_sample_rate()..=c.max_sample_rate())
                                 .contains(&requested_sample_rate)
                             && (min..=max).contains(&&config.period_size)
@@ -497,16 +514,23 @@ impl CpalMidir {
                     cpal::SupportedBufferSize::Unknown => false,
                 })
                 .collect();
+            output_configs.sort_by_key(|c| c.channels());
             let output_config_range = output_configs
                 .iter()
-                .find(|c| c.sample_format() == SampleFormat::F32)
+                .find(|c| {
+                    c.sample_format() == SampleFormat::F32
+                        && c.channels() == output_configs[0].channels()
+                })
                 .or_else(|| output_configs.first())
                 .cloned()
                 .with_context(|| {
                     format!(
-                        "The audio output device does not support {} audio channels at a sample \
-                         rate of {} Hz and a period size of {} samples",
-                        num_output_channels, config.sample_rate, config.period_size,
+                        "The audio output device does not have {} audio channels from channel {} \
+                         at a sample rate of {} Hz and a period size of {} samples",
+                        num_output_channels,
+                        config.output_channel,
+                        config.sample_rate,
+                        config.period_size,
                     )
                 })?;
             let output_config = StreamConfig {
@@ -630,6 +654,7 @@ impl CpalMidir {
         &self,
         input_unparker: Unparker,
         mut input_rb_producer: rtrb::Producer<f32>,
+        stream_channels: usize,
     ) -> impl FnMut(&[T], &InputCallbackInfo) + Send + 'static
     where
         T: Sample,
@@ -640,11 +665,20 @@ impl CpalMidir {
     {
         // This callback needs to copy input samples to a ring buffer that can be read from in the
         // output data callback
+        // Of each frame of the stream only the channels the plugin reads are kept
+        let first = self.config.input_channel.saturating_sub(1) as usize;
+        let width = self
+            .audio_io_layout
+            .main_input_channels
+            .map(NonZeroU32::get)
+            .unwrap_or(0) as usize;
         move |data, _info| {
-            for sample in data {
-                // If for whatever reason the input callback is fired twice before an output
-                // callback, then just spin on this until the push succeeds
-                while input_rb_producer.push(sample.to_sample()).is_err() {}
+            for frame in data.chunks_exact(stream_channels) {
+                for sample in &frame[first..first + width] {
+                    // If for whatever reason the input callback is fired twice before an output
+                    // callback, then just spin on this until the push succeeds
+                    while input_rb_producer.push(sample.to_sample()).is_err() {}
+                }
             }
 
             // The run function is blocked until a single period has been processed here. After this
@@ -753,6 +787,8 @@ impl CpalMidir {
         let mut midi_input_events = Vec::with_capacity(MIDI_EVENT_QUEUE_CAPACITY);
         let mut midi_output_events = Vec::with_capacity(MIDI_EVENT_QUEUE_CAPACITY);
 
+        let device_channels = self.output.config.channels as usize;
+        let first_output_channel = self.config.output_channel.saturating_sub(1) as usize;
         // Can't borrow from `self` in the callback
         let config = self.config.clone();
         let mut num_processed_samples = 0usize;
@@ -770,15 +806,18 @@ impl CpalMidir {
             // storage buffers because it cannot assume that these buffers are safe to write to.
             // Because of that we'll never need to reinitialize these, and the output storage is
             // write-only (with `BufferManager` always zeroing them out when creating the buffers).
+            //
+            // The input ring buffer holds one frame of the plugin's input channels after the other
             match &mut input_rb_consumer {
                 Some(input_rb_consumer) => {
-                    for channel in main_io_storage.iter_mut() {
-                        for sample in channel {
+                    let frames = (data.len() / device_channels).min(buffer_size);
+                    for frame in 0..frames {
+                        for channel in main_io_storage.iter_mut().take(num_input_channels) {
                             loop {
                                 // Keep spinning on this if the output callback somehow outpaces the
                                 // input callback
                                 if let Ok(input_sample) = input_rb_consumer.pop() {
-                                    *sample = input_sample;
+                                    channel[frame] = input_sample;
                                     break;
                                 }
                             }
@@ -828,7 +867,7 @@ impl CpalMidir {
             {
                 // Even though we told CPAL that we wanted `buffer_size` samples, it may still give
                 // us fewer. If we receive more than what we configured, then this will panic.
-                let actual_sample_count = data.len() / num_output_channels;
+                let actual_sample_count = data.len() / device_channels;
                 assert!(
                     actual_sample_count <= buffer_size,
                     "Received {actual_sample_count} samples, while the configured buffer size is \
@@ -903,10 +942,16 @@ impl CpalMidir {
 
             // The buffer's samples need to be written to `data` in an interlaced format
             // SAFETY: Dropping `buffers` allows us to borrow `main_io_storage` again
-            for (i, output_sample) in data.iter_mut().enumerate() {
-                let ch = i % num_output_channels;
-                let n = i / num_output_channels;
-                *output_sample = T::from_sample(main_io_storage[ch][n]);
+            // The device's channels outside the chosen ones stay silent
+            for (n, frame) in data.chunks_exact_mut(device_channels).enumerate() {
+                for (ch, output_sample) in frame.iter_mut().enumerate() {
+                    *output_sample = match ch.checked_sub(first_output_channel) {
+                        Some(plugin_ch) if plugin_ch < num_output_channels => {
+                            T::from_sample(main_io_storage[plugin_ch][n])
+                        }
+                        _ => T::from_sample(0.0),
+                    };
+                }
             }
 
             if let Some(output_event_rb_producer) = &mut output_event_rb_producer {
@@ -924,4 +969,8 @@ impl CpalMidir {
             num_processed_samples += buffer_size;
         }
     }
+}
+
+fn num_input_channels_of(layout: &AudioIOLayout) -> usize {
+    layout.main_input_channels.map(NonZeroU32::get).unwrap_or(0) as usize
 }

@@ -58,6 +58,9 @@ assert_process_allocs = ["dep:assert_no_alloc"]
 # `nih_export_standalone()` function. Disabled by default as this requires
 # building additional dependencies for audio and MIDI handling.
 standalone = ["dep:baseview", "dep:clap", "dep:cpal", "dep:jack", "dep:midir", "dep:rtrb"]
+# Adds ASIO to the standalone's audio backends (`--backend asio`, Windows only). cpal's
+# `asio` feature needs the Steinberg ASIO SDK at build time (`CPAL_ASIO_DIR`).
+asio = ["standalone", "cpal/asio"]
 # Enables the `nih_export_vst3!()` macro. Enabled by default. This feature
 # exists mostly for GPL-compliance reasons, since even if you don't use the VST3
 # wrapper you might otherwise still include a couple (unused) symbols from the

@@ -9,10 +9,26 @@ use self::wrapper::{Wrapper, WrapperError};
 use super::util::setup_logger;
 use crate::prelude::Plugin;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 mod backend;
 mod config;
 mod context;
 mod wrapper;
+
+static TEST_TONE: AtomicBool = AtomicBool::new(false);
+
+/// Turns the standalone host's test tone on or off, from any thread. While it is on, a quiet
+/// 440 Hz sine replaces what the plugin writes to its main output, so the player can check which
+/// outputs of the audio interface they hear. It does nothing outside the standalone host.
+pub fn nih_standalone_set_test_tone(on: bool) {
+    TEST_TONE.store(on, Ordering::Relaxed);
+}
+
+/// Is the standalone host's test tone on
+pub fn nih_standalone_test_tone() -> bool {
+    TEST_TONE.load(Ordering::Relaxed)
+}
 
 /// Open an NIH-plug plugin as a standalone application. If the plugin has an editor, this will open
 /// the editor and block until the editor is closed. Otherwise this will block until SIGINT is
@@ -165,6 +181,16 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                 Ok(backend) => run_wrapper::<P, _>(backend, config),
                 Err(err) => {
                     nih_error!("Could not initialize the WASAPI backend: {:#}", err);
+                    false
+                }
+            }
+        }
+        #[cfg(all(target_os = "windows", feature = "asio"))]
+        config::BackendType::Asio => {
+            match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Asio) {
+                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Err(err) => {
+                    nih_error!("Could not initialize the ASIO backend: {:#}", err);
                     false
                 }
             }
