@@ -35,6 +35,10 @@ pub struct CpalMidir {
 
     midi_input: Mutex<Option<MidirInputDevice>>,
     midi_output: Mutex<Option<MidirOutputDevice>>,
+
+    /// The capture and playback callbacks run one after the other on the driver's thread
+    /// (ASIO), so the capture callback must never wait for the playback one
+    one_callback_thread: bool,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -369,7 +373,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 impl CpalMidir {
     /// Initialize the backend with the specified host. Returns an error if this failed for whatever
     /// reason.
-    pub fn new<P: Plugin>(config: WrapperConfig, cpal_host_id: cpal::HostId) -> Result<Self> {
+    pub fn new<P: Plugin>(mut config: WrapperConfig, cpal_host_id: cpal::HostId) -> Result<Self> {
         let audio_io_layout = config.audio_io_layout_or_exit::<P>();
         let host = cpal::host_from_id(cpal_host_id).context("The Audio API is unavailable")?;
 
@@ -434,10 +438,45 @@ impl CpalMidir {
                 .context("No default audio output device available")?,
         };
 
+        // An ASIO driver is opened once and takes one set of buffers for its inputs and its
+        // outputs together. Two `Device`s for the same driver each prepare buffers of their own,
+        // and the second takes the first's away, so the input never delivers a block. With one
+        // driver for both, input and output share one `Device`
+        #[cfg(feature = "asio")]
+        let output_device = match (&input_device, cpal_host_id) {
+            (Some(input), cpal::HostId::Asio)
+                if input.name().ok().is_some() && input.name().ok() == output_device.name().ok() =>
+            {
+                input.clone()
+            }
+            _ => output_device,
+        };
+
         // The channels are counted from 1 on the command line, from 0 here
         let input_first_channel = config.input_channel.saturating_sub(1) as usize;
         let output_first_channel = config.output_channel.saturating_sub(1) as usize;
         let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
+        // An ASIO driver has the buffer size it was set to in its own control panel (a Focusrite
+        // reports 64 as both its smallest and its largest while it is set to 64), so the size
+        // asked for is brought into the driver's range instead of failing to start
+        #[cfg(feature = "asio")]
+        if cpal_host_id == cpal::HostId::Asio {
+            if let Some(cpal::SupportedBufferSize::Range { min, max }) = output_device
+                .supported_output_configs()
+                .ok()
+                .and_then(|mut configs| configs.next())
+                .map(|c| *c.buffer_size())
+            {
+                let size = config.period_size.clamp(min, max);
+                if size != config.period_size {
+                    nih_log!(
+                        "The ASIO driver takes buffers of {min} to {max} samples: using {size}                          instead of {}",
+                        config.period_size
+                    );
+                    config.period_size = size;
+                }
+            }
+        }
         let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
         let num_input_channels = audio_io_layout
             .main_input_channels
@@ -647,6 +686,8 @@ impl CpalMidir {
 
             midi_input: Mutex::new(midi_input),
             midi_output: Mutex::new(midi_output),
+
+            one_callback_thread: cfg!(feature = "asio") && cpal_host_id == cpal::HostId::Asio,
         })
     }
 
@@ -672,12 +713,20 @@ impl CpalMidir {
             .main_input_channels
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
+        let one_callback_thread = self.one_callback_thread;
         move |data, _info| {
             for frame in data.chunks_exact(stream_channels) {
                 for sample in &frame[first..first + width] {
                     // If for whatever reason the input callback is fired twice before an output
                     // callback, then just spin on this until the push succeeds
-                    while input_rb_producer.push(sample.to_sample()).is_err() {}
+                    // (With one thread for both callbacks that would wait for ever: the playback
+                    // callback that frees the room runs after this one, so a sample that does
+                    // not fit is dropped)
+                    while input_rb_producer.push(sample.to_sample()).is_err() {
+                        if one_callback_thread {
+                            break;
+                        }
+                    }
                 }
             }
 
