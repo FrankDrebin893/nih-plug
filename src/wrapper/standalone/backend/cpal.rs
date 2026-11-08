@@ -25,6 +25,18 @@ use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
 const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
 
+/// An ASIO stream takes over every channel it opens, so it opens only the ones the plugin uses
+/// (the others stay for other programs, as a DAW leaves them); other drivers keep the whole
+/// device's channels
+fn asio_channels(host: cpal::HostId, all: cpal::ChannelCount, used: usize) -> cpal::ChannelCount {
+    #[cfg(feature = "asio")]
+    if host == cpal::HostId::Asio {
+        return (used.max(1) as cpal::ChannelCount).min(all);
+    }
+    let _ = (host, used);
+    all
+}
+
 /// Uses CPAL for audio and midir for MIDI.
 pub struct CpalMidir {
     config: WrapperConfig,
@@ -521,7 +533,11 @@ impl CpalMidir {
 
                 // We already checked that these settings are valid
                 let input_config = StreamConfig {
-                    channels: input_config_range.channels(),
+                    channels: asio_channels(
+                        cpal_host_id,
+                        input_config_range.channels(),
+                        input_first_channel + num_input_channels,
+                    ),
                     sample_rate: requested_sample_rate,
                     buffer_size: requested_buffer_size,
                 };
@@ -573,7 +589,11 @@ impl CpalMidir {
                     )
                 })?;
             let output_config = StreamConfig {
-                channels: output_config_range.channels(),
+                channels: asio_channels(
+                    cpal_host_id,
+                    output_config_range.channels(),
+                    output_first_channel + num_output_channels,
+                ),
                 sample_rate: requested_sample_rate,
                 buffer_size: requested_buffer_size,
             };
