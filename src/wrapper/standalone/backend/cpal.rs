@@ -457,7 +457,8 @@ impl CpalMidir {
         #[cfg(feature = "asio")]
         let output_device = match (&input_device, cpal_host_id) {
             (Some(input), cpal::HostId::Asio)
-                if input.name().ok().is_some() && input.name().ok() == output_device.name().ok() =>
+                if input.name().ok().is_some()
+                    && input.name().ok() == output_device.name().ok() =>
             {
                 input.clone()
             }
@@ -707,7 +708,13 @@ impl CpalMidir {
             midi_input: Mutex::new(midi_input),
             midi_output: Mutex::new(midi_output),
 
-            one_callback_thread: cfg!(feature = "asio") && cpal_host_id == cpal::HostId::Asio,
+            one_callback_thread: {
+                #[cfg(feature = "asio")]
+                let asio = cpal_host_id == cpal::HostId::Asio;
+                #[cfg(not(feature = "asio"))]
+                let asio = false;
+                asio
+            },
         })
     }
 
@@ -862,184 +869,221 @@ impl CpalMidir {
         let config = self.config.clone();
         let mut num_processed_samples = 0usize;
         move |data, _info| {
-            let mut transport = Transport::new(config.sample_rate);
-            transport.pos_samples = Some(num_processed_samples as i64);
-            transport.tempo = Some(config.tempo as f64);
-            transport.time_sig_numerator = Some(config.timesig_num as i32);
-            transport.time_sig_denominator = Some(config.timesig_denom as i32);
-            transport.playing = true;
+            // A shared-mode driver (WASAPI) may hand out more frames than the `buffer_size` we
+            // asked for, and the count may change between calls. The callback is therefore
+            // processed in chunks of at most `buffer_size` frames.
+            let total_frames = data.len() / device_channels;
+            let mut frame_offset = 0usize;
+            for chunk_len in chunk_lengths(total_frames, buffer_size) {
+                let data = &mut data
+                    [frame_offset * device_channels..(frame_offset + chunk_len) * device_channels];
+                frame_offset += chunk_len;
+                let mut transport = Transport::new(config.sample_rate);
+                transport.pos_samples = Some(num_processed_samples as i64);
+                transport.tempo = Some(config.tempo as f64);
+                transport.time_sig_numerator = Some(config.timesig_num as i32);
+                transport.time_sig_denominator = Some(config.timesig_denom as i32);
+                transport.playing = true;
 
-            // If an input was configured, then the output buffer is filled with (interleaved) input
-            // samples. Otherwise it gets filled with silence. There is no need to zero out any of
-            // the other buffers. The `BufferManager` will copy the auxiliary input data to its own
-            // storage buffers because it cannot assume that these buffers are safe to write to.
-            // Because of that we'll never need to reinitialize these, and the output storage is
-            // write-only (with `BufferManager` always zeroing them out when creating the buffers).
-            //
-            // The input ring buffer holds one frame of the plugin's input channels after the other
-            match &mut input_rb_consumer {
-                Some(input_rb_consumer) => {
-                    let frames = (data.len() / device_channels).min(buffer_size);
-                    for frame in 0..frames {
-                        for channel in main_io_storage.iter_mut().take(num_input_channels) {
-                            loop {
-                                // Keep spinning on this if the output callback somehow outpaces the
-                                // input callback
-                                if let Ok(input_sample) = input_rb_consumer.pop() {
-                                    channel[frame] = input_sample;
-                                    break;
+                // If an input was configured, then the output buffer is filled with (interleaved) input
+                // samples. Otherwise it gets filled with silence. There is no need to zero out any of
+                // the other buffers. The `BufferManager` will copy the auxiliary input data to its own
+                // storage buffers because it cannot assume that these buffers are safe to write to.
+                // Because of that we'll never need to reinitialize these, and the output storage is
+                // write-only (with `BufferManager` always zeroing them out when creating the buffers).
+                //
+                // The input ring buffer holds one frame of the plugin's input channels after the other
+                match &mut input_rb_consumer {
+                    Some(input_rb_consumer) => {
+                        let frames = chunk_len;
+                        for frame in 0..frames {
+                            for channel in main_io_storage.iter_mut().take(num_input_channels) {
+                                loop {
+                                    // Keep spinning on this if the output callback somehow outpaces the
+                                    // input callback
+                                    if let Ok(input_sample) = input_rb_consumer.pop() {
+                                        channel[frame] = input_sample;
+                                        break;
+                                    }
                                 }
                             }
                         }
                     }
-                }
-                None => {
-                    for channel in main_io_storage.iter_mut() {
-                        channel.fill(0.0);
-                    }
-                }
-            }
-
-            // Things may have been moved in between callbacks, so these pointers need to be set up
-            // again on each invocation
-            main_io_channel_pointers.get().clear();
-            for channel in main_io_storage.iter_mut() {
-                assert!(channel.len() == buffer_size);
-
-                main_io_channel_pointers.get().push(channel.as_mut_ptr());
-            }
-
-            for (input_channel_pointers, input_storage) in aux_input_channel_pointers
-                .iter_mut()
-                .zip(aux_input_storage.iter_mut())
-            {
-                input_channel_pointers.get().clear();
-                for channel in input_storage.iter_mut() {
-                    assert!(channel.len() == buffer_size);
-
-                    input_channel_pointers.get().push(channel.as_mut_ptr());
-                }
-            }
-
-            for (output_channel_pointers, output_storage) in aux_output_channel_pointers
-                .iter_mut()
-                .zip(aux_output_storage.iter_mut())
-            {
-                output_channel_pointers.get().clear();
-                for channel in output_storage.iter_mut() {
-                    assert!(channel.len() == buffer_size);
-
-                    output_channel_pointers.get().push(channel.as_mut_ptr());
-                }
-            }
-
-            {
-                // Even though we told CPAL that we wanted `buffer_size` samples, it may still give
-                // us fewer. If we receive more than what we configured, then this will panic.
-                let actual_sample_count = data.len() / device_channels;
-                assert!(
-                    actual_sample_count <= buffer_size,
-                    "Received {actual_sample_count} samples, while the configured buffer size is \
-                     {buffer_size}"
-                );
-                let buffers = unsafe {
-                    buffer_manager.create_buffers(0, actual_sample_count, |buffer_sources| {
-                        *buffer_sources.main_output_channel_pointers = Some(ChannelPointers {
-                            ptrs: NonNull::new(main_io_channel_pointers.get().as_mut_ptr())
-                                .unwrap(),
-                            num_channels: main_io_channel_pointers.get().len(),
-                        });
-                        *buffer_sources.main_input_channel_pointers = Some(ChannelPointers {
-                            ptrs: NonNull::new(main_io_channel_pointers.get().as_mut_ptr())
-                                .unwrap(),
-                            num_channels: num_input_channels
-                                .min(main_io_channel_pointers.get().len()),
-                        });
-
-                        for (input_source_channel_pointers, input_channel_pointers) in
-                            buffer_sources
-                                .aux_input_channel_pointers
-                                .iter_mut()
-                                .zip(aux_input_channel_pointers.iter_mut())
-                        {
-                            *input_source_channel_pointers = Some(ChannelPointers {
-                                ptrs: NonNull::new(input_channel_pointers.get().as_mut_ptr())
-                                    .unwrap(),
-                                num_channels: input_channel_pointers.get().len(),
-                            });
+                    None => {
+                        for channel in main_io_storage.iter_mut() {
+                            channel.fill(0.0);
                         }
-
-                        for (output_source_channel_pointers, output_channel_pointers) in
-                            buffer_sources
-                                .aux_output_channel_pointers
-                                .iter_mut()
-                                .zip(aux_output_channel_pointers.iter_mut())
-                        {
-                            *output_source_channel_pointers = Some(ChannelPointers {
-                                ptrs: NonNull::new(output_channel_pointers.get().as_mut_ptr())
-                                    .unwrap(),
-                                num_channels: output_channel_pointers.get().len(),
-                            });
-                        }
-                    })
-                };
-
-                midi_input_events.clear();
-                if let Some(input_event_rb_consumer) = &mut input_event_rb_consumer {
-                    if let Ok(event) = input_event_rb_consumer.pop() {
-                        midi_input_events.push(event);
                     }
                 }
 
-                midi_output_events.clear();
-                let mut aux = AuxiliaryBuffers {
-                    inputs: buffers.aux_inputs,
-                    outputs: buffers.aux_outputs,
-                };
-                if !cb(
-                    buffers.main_buffer,
-                    &mut aux,
-                    transport,
-                    &midi_input_events,
-                    &mut midi_output_events,
-                ) {
-                    // TODO: Some way to immediately terminate the stream here would be nice
-                    unparker.unpark();
-                    return;
-                }
-            }
+                // Things may have been moved in between callbacks, so these pointers need to be set up
+                // again on each invocation
+                main_io_channel_pointers.get().clear();
+                for channel in main_io_storage.iter_mut() {
+                    assert!(channel.len() == buffer_size);
 
-            // The buffer's samples need to be written to `data` in an interlaced format
-            // SAFETY: Dropping `buffers` allows us to borrow `main_io_storage` again
-            // The device's channels outside the chosen ones stay silent
-            for (n, frame) in data.chunks_exact_mut(device_channels).enumerate() {
-                for (ch, output_sample) in frame.iter_mut().enumerate() {
-                    *output_sample = match ch.checked_sub(first_output_channel) {
-                        Some(plugin_ch) if plugin_ch < num_output_channels => {
-                            T::from_sample(main_io_storage[plugin_ch][n])
-                        }
-                        _ => T::from_sample(0.0),
+                    main_io_channel_pointers.get().push(channel.as_mut_ptr());
+                }
+
+                for (input_channel_pointers, input_storage) in aux_input_channel_pointers
+                    .iter_mut()
+                    .zip(aux_input_storage.iter_mut())
+                {
+                    input_channel_pointers.get().clear();
+                    for channel in input_storage.iter_mut() {
+                        assert!(channel.len() == buffer_size);
+
+                        input_channel_pointers.get().push(channel.as_mut_ptr());
+                    }
+                }
+
+                for (output_channel_pointers, output_storage) in aux_output_channel_pointers
+                    .iter_mut()
+                    .zip(aux_output_storage.iter_mut())
+                {
+                    output_channel_pointers.get().clear();
+                    for channel in output_storage.iter_mut() {
+                        assert!(channel.len() == buffer_size);
+
+                        output_channel_pointers.get().push(channel.as_mut_ptr());
+                    }
+                }
+
+                {
+                    let actual_sample_count = chunk_len;
+                    let buffers = unsafe {
+                        buffer_manager.create_buffers(0, actual_sample_count, |buffer_sources| {
+                            *buffer_sources.main_output_channel_pointers = Some(ChannelPointers {
+                                ptrs: NonNull::new(main_io_channel_pointers.get().as_mut_ptr())
+                                    .unwrap(),
+                                num_channels: main_io_channel_pointers.get().len(),
+                            });
+                            *buffer_sources.main_input_channel_pointers = Some(ChannelPointers {
+                                ptrs: NonNull::new(main_io_channel_pointers.get().as_mut_ptr())
+                                    .unwrap(),
+                                num_channels: num_input_channels
+                                    .min(main_io_channel_pointers.get().len()),
+                            });
+
+                            for (input_source_channel_pointers, input_channel_pointers) in
+                                buffer_sources
+                                    .aux_input_channel_pointers
+                                    .iter_mut()
+                                    .zip(aux_input_channel_pointers.iter_mut())
+                            {
+                                *input_source_channel_pointers = Some(ChannelPointers {
+                                    ptrs: NonNull::new(input_channel_pointers.get().as_mut_ptr())
+                                        .unwrap(),
+                                    num_channels: input_channel_pointers.get().len(),
+                                });
+                            }
+
+                            for (output_source_channel_pointers, output_channel_pointers) in
+                                buffer_sources
+                                    .aux_output_channel_pointers
+                                    .iter_mut()
+                                    .zip(aux_output_channel_pointers.iter_mut())
+                            {
+                                *output_source_channel_pointers = Some(ChannelPointers {
+                                    ptrs: NonNull::new(output_channel_pointers.get().as_mut_ptr())
+                                        .unwrap(),
+                                    num_channels: output_channel_pointers.get().len(),
+                                });
+                            }
+                        })
                     };
-                }
-            }
 
-            if let Some(output_event_rb_producer) = &mut output_event_rb_producer {
-                for event in midi_output_events.drain(..) {
-                    if output_event_rb_producer
-                        .try_send(MidiOutputTask::Send(event))
-                        .is_err()
-                    {
-                        nih_error!("The MIDI output event queue was full, dropping event");
-                        break;
+                    midi_input_events.clear();
+                    if let Some(input_event_rb_consumer) = &mut input_event_rb_consumer {
+                        if let Ok(event) = input_event_rb_consumer.pop() {
+                            midi_input_events.push(event);
+                        }
+                    }
+
+                    midi_output_events.clear();
+                    let mut aux = AuxiliaryBuffers {
+                        inputs: buffers.aux_inputs,
+                        outputs: buffers.aux_outputs,
+                    };
+                    if !cb(
+                        buffers.main_buffer,
+                        &mut aux,
+                        transport,
+                        &midi_input_events,
+                        &mut midi_output_events,
+                    ) {
+                        // TODO: Some way to immediately terminate the stream here would be nice
+                        unparker.unpark();
+                        return;
                     }
                 }
-            }
 
-            num_processed_samples += buffer_size;
+                // The buffer's samples need to be written to `data` in an interlaced format
+                // SAFETY: Dropping `buffers` allows us to borrow `main_io_storage` again
+                // The device's channels outside the chosen ones stay silent
+                for (n, frame) in data.chunks_exact_mut(device_channels).enumerate() {
+                    for (ch, output_sample) in frame.iter_mut().enumerate() {
+                        *output_sample = match ch.checked_sub(first_output_channel) {
+                            Some(plugin_ch) if plugin_ch < num_output_channels => {
+                                T::from_sample(main_io_storage[plugin_ch][n])
+                            }
+                            _ => T::from_sample(0.0),
+                        };
+                    }
+                }
+
+                if let Some(output_event_rb_producer) = &mut output_event_rb_producer {
+                    for event in midi_output_events.drain(..) {
+                        if output_event_rb_producer
+                            .try_send(MidiOutputTask::Send(event))
+                            .is_err()
+                        {
+                            nih_error!("The MIDI output event queue was full, dropping event");
+                            break;
+                        }
+                    }
+                }
+
+                num_processed_samples += chunk_len;
+            }
         }
     }
 }
 
 fn num_input_channels_of(layout: &AudioIOLayout) -> usize {
     layout.main_input_channels.map(NonZeroU32::get).unwrap_or(0) as usize
+}
+
+/// The lengths of the chunks a callback of `frames` frames is processed in: every one at most
+/// `max` long, in order, together exactly `frames`. A shared-mode driver may give more frames than
+/// the buffer size asked for.
+fn chunk_lengths(frames: usize, max: usize) -> impl Iterator<Item = usize> {
+    let max = max.max(1);
+    let mut left = frames;
+    std::iter::from_fn(move || {
+        if left == 0 {
+            None
+        } else {
+            let n = left.min(max);
+            left -= n;
+            Some(n)
+        }
+    })
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::chunk_lengths;
+
+    #[test]
+    fn chunks_cover_every_frame_in_order() {
+        assert_eq!(chunk_lengths(528, 512).collect::<Vec<_>>(), vec![512, 16]);
+        assert_eq!(chunk_lengths(100, 512).collect::<Vec<_>>(), vec![100]);
+        assert_eq!(chunk_lengths(512, 512).collect::<Vec<_>>(), vec![512]);
+        assert_eq!(
+            chunk_lengths(1100, 512).collect::<Vec<_>>(),
+            vec![512, 512, 76]
+        );
+        assert_eq!(chunk_lengths(0, 512).count(), 0);
+    }
 }
