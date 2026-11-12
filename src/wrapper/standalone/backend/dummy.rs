@@ -96,7 +96,14 @@ impl<P: Plugin> Backend<P> for Dummy {
         // This queue will never actually be used
         let mut midi_output_events = Vec::with_capacity(1024);
         let mut num_processed_samples = 0usize;
+        // There are no devices to change, but the request is answered as the other backends do,
+        // so a program (and a test) can use it with this one too
+        let parker = crossbeam::sync::Parker::new();
+        super::super::set_reconfigure_waker(Some(parker.unparker().clone()));
         loop {
+            if let Some(request) = super::super::take_reconfigure_request() {
+                let _ = request.reply.send(Ok(()));
+            }
             let period_start = Instant::now();
 
             let mut transport = Transport::new(self.config.sample_rate);
@@ -175,6 +182,7 @@ impl<P: Plugin> Backend<P> for Dummy {
             let period_end = Instant::now();
             std::thread::sleep((period_start + interval).saturating_duration_since(period_end));
         }
+        super::super::set_reconfigure_waker(None);
     }
 }
 

@@ -9,8 +9,8 @@ pub use crate::nih_export_clap;
 pub use crate::nih_export_vst3;
 #[cfg(feature = "standalone")]
 pub use crate::wrapper::standalone::{
-    nih_export_standalone, nih_export_standalone_with_args, nih_standalone_set_test_tone,
-    nih_standalone_test_tone,
+    nih_export_standalone, nih_export_standalone_with_args, nih_standalone_reconfigure,
+    nih_standalone_set_test_tone, nih_standalone_test_tone, StandaloneDevices,
 };
 
 pub use crate::formatters;

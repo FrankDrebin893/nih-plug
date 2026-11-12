@@ -10,6 +10,8 @@ use super::util::setup_logger;
 use crate::prelude::Plugin;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Mutex;
 
 mod backend;
 mod config;
@@ -28,6 +30,82 @@ pub fn nih_standalone_set_test_tone(on: bool) {
 /// Is the standalone host's test tone on
 pub fn nih_standalone_test_tone() -> bool {
     TEST_TONE.load(Ordering::Relaxed)
+}
+
+/// What [`nih_standalone_reconfigure()`] changes: the audio devices and the channels of them the
+/// plugin reads and writes. The driver, the sample rate and the period size stay as they are.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StandaloneDevices {
+    /// The input device by name. `None` connects no input.
+    pub input_device: Option<String>,
+    /// The output device by name. `None` is the driver's default output.
+    pub output_device: Option<String>,
+    /// The first channel (counted from 1) of the input device the plugin reads. 0 counts as 1.
+    pub input_channel: u32,
+    /// The first channel (counted from 1) of the output device the plugin writes. 0 counts as 1.
+    pub output_channel: u32,
+}
+
+/// A change of devices that waits for the running backend to take it.
+pub(crate) struct ReconfigureRequest {
+    pub devices: StandaloneDevices,
+    pub reply: mpsc::Sender<Result<(), String>>,
+}
+
+static RECONFIGURE: Mutex<Option<ReconfigureRequest>> = Mutex::new(None);
+/// Wakes the running backend, which exists only while it can take a request
+static RECONFIGURE_WAKER: Mutex<Option<crossbeam::sync::Unparker>> = Mutex::new(None);
+
+/// Asks the running standalone host to close its audio streams and open them again on other
+/// devices or channels, while the plugin keeps running (the same instance: no `initialize`, no
+/// state lost, the process callback only misses the blocks of the gap). Returns at once.
+///
+/// - `Err` at once: this backend cannot do it (JACK, or no backend running, or another request is
+///   still being taken). The caller keeps the old devices and may start the program again
+///   instead
+/// - `Ok(receiver)`: the answer comes on `receiver` once the streams are open on the new devices
+///   (`Ok`), or when they would not open (`Err` with what went wrong), in which case the old
+///   devices have been opened again, so a bad choice never leaves the plugin silent
+pub fn nih_standalone_reconfigure(
+    devices: StandaloneDevices,
+) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+    let waker = RECONFIGURE_WAKER.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(waker) = waker.as_ref() else {
+        return Err("this audio driver cannot change devices while running".into());
+    };
+    let mut pending = RECONFIGURE.lock().unwrap_or_else(|e| e.into_inner());
+    if pending.is_some() {
+        return Err("the audio devices are already being changed".into());
+    }
+    let (reply, receiver) = mpsc::channel();
+    *pending = Some(ReconfigureRequest { devices, reply });
+    waker.unpark();
+    Ok(receiver)
+}
+
+/// The backend says it takes requests while `waker` is `Some`
+pub(crate) fn set_reconfigure_waker(waker: Option<crossbeam::sync::Unparker>) {
+    *RECONFIGURE_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = waker;
+    if waker_is_none() {
+        // A request nobody will take is answered, not left hanging
+        if let Some(request) = RECONFIGURE.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = request
+                .reply
+                .send(Err("the audio backend has stopped".into()));
+        }
+    }
+}
+
+fn waker_is_none() -> bool {
+    RECONFIGURE_WAKER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_none()
+}
+
+/// The request waiting for the backend, if any
+pub(crate) fn take_reconfigure_request() -> Option<ReconfigureRequest> {
+    RECONFIGURE.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
 /// Open an NIH-plug plugin as a standalone application. If the plugin has an editor, this will open
@@ -225,5 +303,117 @@ fn print_error(error: WrapperError) {
         WrapperError::InitializationFailed => {
             nih_error!("The plugin failed to initialize");
         }
+    }
+}
+
+#[cfg(test)]
+mod reconfigure_tests {
+    use super::*;
+    use crate::prelude::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    static INITIALIZED: AtomicUsize = AtomicUsize::new(0);
+    static BLOCKS: AtomicUsize = AtomicUsize::new(0);
+    static STOP: AtomicBool = AtomicBool::new(false);
+
+    struct NoParams;
+
+    // SAFETY: no parameters, so no pointers
+    unsafe impl Params for NoParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct Counter;
+
+    impl Plugin for Counter {
+        const NAME: &'static str = "Counter";
+        const VENDOR: &'static str = "Test";
+        const URL: &'static str = "";
+        const EMAIL: &'static str = "";
+        const VERSION: &'static str = "0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: None,
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            Arc::new(NoParams)
+        }
+
+        fn initialize(
+            &mut self,
+            _: &AudioIOLayout,
+            _: &BufferConfig,
+            _: &mut impl InitContext<Self>,
+        ) -> bool {
+            INITIALIZED.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+
+        fn process(
+            &mut self,
+            _: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            _: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            if STOP.load(Ordering::SeqCst) {
+                return ProcessStatus::Error("stopped");
+            }
+            BLOCKS.fetch_add(1, Ordering::SeqCst);
+            ProcessStatus::Normal
+        }
+    }
+
+    use std::num::NonZeroU32;
+
+    fn wait_for(what: impl Fn() -> bool) {
+        let start = Instant::now();
+        while !what() {
+            assert!(start.elapsed() < Duration::from_secs(10), "timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// One test, since the host and the request slot are process-wide
+    #[test]
+    fn reconfigure_keeps_the_plugin_running_and_initialised_once() {
+        let host = std::thread::spawn(|| {
+            nih_export_standalone_with_args::<Counter, _>(
+                ["counter", "--backend", "dummy", "-p", "64"].map(String::from),
+            )
+        });
+        wait_for(|| BLOCKS.load(Ordering::SeqCst) > 3);
+
+        let devices = StandaloneDevices {
+            output_device: Some("Other".into()),
+            input_channel: 1,
+            output_channel: 3,
+            ..StandaloneDevices::default()
+        };
+        let answer = nih_standalone_reconfigure(devices).expect("the host takes requests");
+        assert_eq!(answer.recv_timeout(Duration::from_secs(5)), Ok(Ok(())));
+
+        // The same callback goes on
+        let after = BLOCKS.load(Ordering::SeqCst);
+        wait_for(|| BLOCKS.load(Ordering::SeqCst) > after + 3);
+        assert_eq!(
+            INITIALIZED.load(Ordering::SeqCst),
+            1,
+            "devices changing is not a new initialize"
+        );
+
+        STOP.store(true, Ordering::SeqCst);
+        // The audio ends with the plugin's error; a host without an editor then blocks until it
+        // is interrupted, so it is not joined. Nobody takes requests any more
+        wait_for(|| nih_standalone_reconfigure(StandaloneDevices::default()).is_err());
+        drop(host);
     }
 }

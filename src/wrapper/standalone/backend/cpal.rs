@@ -12,6 +12,8 @@ use rtrb::RingBuffer;
 use std::borrow::Borrow;
 use std::num::NonZeroU32;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 
 use super::super::config::WrapperConfig;
@@ -37,10 +39,226 @@ fn asio_channels(host: cpal::HostId, all: cpal::ChannelCount, used: usize) -> cp
     all
 }
 
+/// Opens the devices a configuration names, with the stream configuration each takes. The input is
+/// `None` unless one is named, to keep a microphone from feeding back
+fn open_devices(
+    config: &mut WrapperConfig,
+    audio_io_layout: &AudioIOLayout,
+    cpal_host_id: cpal::HostId,
+) -> Result<(Option<CpalDevice>, CpalDevice)> {
+    let host = cpal::host_from_id(cpal_host_id).context("The Audio API is unavailable")?;
+    let audio_io_layout = *audio_io_layout;
+
+    // No input device is connected unless requested by the user to avoid feedback loops
+    let input_device = config
+        .input_device
+        .as_ref()
+        .map(|name| -> Result<Device> {
+            let device = host
+                .input_devices()
+                .context("No audio input devices available")?
+                // `.name()` returns a `Result` with a non-Eq error type so you can't compare this
+                // directly
+                .find(|d| d.name().as_deref().map(|n| n == name).unwrap_or(false))
+                .with_context(|| {
+                    // This is a bit awkward, but instead of adding a dedicated option we'll just
+                    // list all of the available devices in the error message when the chosen device
+                    // does not exist
+                    let mut message =
+                        format!("Unknown input device '{name}'. Available devices are:");
+                    for device_name in host.input_devices().unwrap().flat_map(|d| d.name()) {
+                        message.push_str(&format!("\n{device_name}"))
+                    }
+
+                    message
+                })?;
+
+            Ok(device)
+        })
+        .transpose()?;
+
+    let output_device = match config.output_device.as_ref() {
+        Some(name) => host
+            .output_devices()
+            .context("No audio output devices available")?
+            .find(|d| d.name().as_deref().map(|n| n == name).unwrap_or(false))
+            .with_context(|| {
+                let mut message = format!("Unknown output device '{name}'. Available devices are:");
+                for device_name in host.output_devices().unwrap().flat_map(|d| d.name()) {
+                    message.push_str(&format!("\n{device_name}"))
+                }
+
+                message
+            })?,
+        None => host
+            .default_output_device()
+            .context("No default audio output device available")?,
+    };
+
+    // An ASIO driver is opened once and takes one set of buffers for its inputs and its
+    // outputs together. Two `Device`s for the same driver each prepare buffers of their own,
+    // and the second takes the first's away, so the input never delivers a block. With one
+    // driver for both, input and output share one `Device`
+    #[cfg(feature = "asio")]
+    let output_device = match (&input_device, cpal_host_id) {
+        (Some(input), cpal::HostId::Asio)
+            if input.name().ok().is_some() && input.name().ok() == output_device.name().ok() =>
+        {
+            input.clone()
+        }
+        _ => output_device,
+    };
+
+    // The channels are counted from 1 on the command line, from 0 here
+    let input_first_channel = config.input_channel.saturating_sub(1) as usize;
+    let output_first_channel = config.output_channel.saturating_sub(1) as usize;
+    let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
+    // An ASIO driver has the buffer size it was set to in its own control panel (a Focusrite
+    // reports 64 as both its smallest and its largest while it is set to 64), so the size
+    // asked for is brought into the driver's range instead of failing to start
+    #[cfg(feature = "asio")]
+    if cpal_host_id == cpal::HostId::Asio {
+        if let Some(cpal::SupportedBufferSize::Range { min, max }) = output_device
+            .supported_output_configs()
+            .ok()
+            .and_then(|mut configs| configs.next())
+            .map(|c| *c.buffer_size())
+        {
+            let size = config.period_size.clamp(min, max);
+            if size != config.period_size {
+                nih_log!(
+                        "The ASIO driver takes buffers of {min} to {max} samples: using {size}                          instead of {}",
+                        config.period_size
+                    );
+                config.period_size = size;
+            }
+        }
+    }
+    let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
+    let num_input_channels = audio_io_layout
+        .main_input_channels
+        .map(NonZeroU32::get)
+        .unwrap_or_default() as usize;
+    let input = input_device
+        .map(|device| -> Result<CpalDevice> {
+            let mut input_configs: Vec<_> = device
+                .supported_input_configs()
+                .context("Could not get supported audio input configurations")?
+                .filter(|c| match c.buffer_size() {
+                    cpal::SupportedBufferSize::Range { min, max } => {
+                        c.channels() as usize >= input_first_channel + num_input_channels
+                            && (c.min_sample_rate()..=c.max_sample_rate())
+                                .contains(&requested_sample_rate)
+                            && (min..=max).contains(&&config.period_size)
+                    }
+                    cpal::SupportedBufferSize::Unknown => false,
+                })
+                .collect();
+            // The fewest channels that reach the chosen ones
+            input_configs.sort_by_key(|c| c.channels());
+            let input_config_range = input_configs
+                .iter()
+                // Prefer floating point samples to avoid conversions
+                .find(|c| {
+                    c.sample_format() == SampleFormat::F32
+                        && c.channels() == input_configs[0].channels()
+                })
+                .or_else(|| input_configs.first())
+                .cloned()
+                .with_context(|| {
+                    format!(
+                        "The audio input device does not have {} audio channels from \
+                             channel {} at a sample rate of {} Hz and a period size of {} samples",
+                        num_input_channels,
+                        config.input_channel,
+                        config.sample_rate,
+                        config.period_size,
+                    )
+                })?;
+
+            // We already checked that these settings are valid
+            let input_config = StreamConfig {
+                channels: asio_channels(
+                    cpal_host_id,
+                    input_config_range.channels(),
+                    input_first_channel + num_input_channels,
+                ),
+                sample_rate: requested_sample_rate,
+                buffer_size: requested_buffer_size,
+            };
+            let input_sample_format = input_config_range.sample_format();
+
+            Ok(CpalDevice {
+                device,
+                config: input_config,
+                sample_format: input_sample_format,
+            })
+        })
+        .transpose()?;
+
+    let num_output_channels = audio_io_layout
+        .main_output_channels
+        .map(NonZeroU32::get)
+        .unwrap_or_default() as usize;
+    let output = {
+        let mut output_configs: Vec<_> = output_device
+            .supported_output_configs()
+            .context("Could not get supported audio output configurations")?
+            .filter(|c| match c.buffer_size() {
+                cpal::SupportedBufferSize::Range { min, max } => {
+                    c.channels() as usize >= output_first_channel + num_output_channels
+                        && (c.min_sample_rate()..=c.max_sample_rate())
+                            .contains(&requested_sample_rate)
+                        && (min..=max).contains(&&config.period_size)
+                }
+                cpal::SupportedBufferSize::Unknown => false,
+            })
+            .collect();
+        output_configs.sort_by_key(|c| c.channels());
+        let output_config_range = output_configs
+            .iter()
+            .find(|c| {
+                c.sample_format() == SampleFormat::F32
+                    && c.channels() == output_configs[0].channels()
+            })
+            .or_else(|| output_configs.first())
+            .cloned()
+            .with_context(|| {
+                format!(
+                    "The audio output device does not have {} audio channels from channel {} \
+                         at a sample rate of {} Hz and a period size of {} samples",
+                    num_output_channels,
+                    config.output_channel,
+                    config.sample_rate,
+                    config.period_size,
+                )
+            })?;
+        let output_config = StreamConfig {
+            channels: asio_channels(
+                cpal_host_id,
+                output_config_range.channels(),
+                output_first_channel + num_output_channels,
+            ),
+            sample_rate: requested_sample_rate,
+            buffer_size: requested_buffer_size,
+        };
+        let output_sample_format = output_config_range.sample_format();
+
+        CpalDevice {
+            device: output_device,
+            config: output_config,
+            sample_format: output_sample_format,
+        }
+    };
+
+    Ok((input, output))
+}
+
 /// Uses CPAL for audio and midir for MIDI.
 pub struct CpalMidir {
     config: WrapperConfig,
     audio_io_layout: AudioIOLayout,
+    host_id: cpal::HostId,
 
     input: Option<CpalDevice>,
     output: CpalDevice,
@@ -120,6 +338,138 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             + 'static
             + Send,
     ) {
+        // The process callback outlives one set of streams: a request to change the devices
+        // (`nih_standalone_reconfigure()`) closes the streams, opens the new ones and gives them
+        // the same callback. Only an output callback calls it, and only one set of streams
+        // exists at a time, so the lock is never contended
+        let cb = Arc::new(Mutex::new(cb));
+        let parker = Parker::new();
+        super::super::set_reconfigure_waker(Some(parker.unparker().clone()));
+
+        let mut trying: Option<Trying> = None;
+        let mut retries = 0;
+        let mut opened_once = false;
+        loop {
+            match self.run_once::<P, _>(&cb, &parker, &mut trying) {
+                Outcome::Finished => break,
+                Outcome::Reconfigure(request) => {
+                    opened_once = true;
+                    retries = 0;
+                    let mut config = self.config.clone();
+                    config.input_device = request.devices.input_device.clone();
+                    config.output_device = request.devices.output_device.clone();
+                    config.input_channel = request.devices.input_channel.max(1);
+                    config.output_channel = request.devices.output_channel.max(1);
+                    match open_devices(&mut config, &self.audio_io_layout, self.host_id) {
+                        Ok((input, output)) => {
+                            let saved = Saved {
+                                config: std::mem::replace(&mut self.config, config),
+                                input: std::mem::replace(&mut self.input, input),
+                                output: std::mem::replace(&mut self.output, output),
+                            };
+                            trying = Some(Trying {
+                                reply: request.reply,
+                                saved,
+                            });
+                        }
+                        // The old devices have been let go, so they are opened again
+                        Err(err) => {
+                            let _ = request.reply.send(Err(format!("{err:#}")));
+                        }
+                    }
+                }
+                Outcome::OpenFailed(err) => {
+                    if !opened_once {
+                        super::super::set_reconfigure_waker(None);
+                        panic!("Fatal error opening the audio streams: {err:#}");
+                    }
+                    nih_error!("Could not open the audio streams: {err:#}");
+                    // An ASIO driver may need a moment to let go of what it had before
+                    if retries < OPEN_RETRIES {
+                        retries += 1;
+                        std::thread::sleep(OPEN_RETRY_WAIT);
+                        continue;
+                    }
+                    retries = 0;
+                    match trying.take() {
+                        // The new devices will not open: the old ones play again
+                        Some(Trying { reply, saved }) => {
+                            self.config = saved.config;
+                            self.input = saved.input;
+                            self.output = saved.output;
+                            let _ = reply.send(Err(format!("{err:#}")));
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+        super::super::set_reconfigure_waker(None);
+    }
+}
+
+/// How often and how long an opening is tried again after a change of devices
+const OPEN_RETRIES: u32 = 10;
+const OPEN_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// What a run of one set of streams ended with
+enum Outcome {
+    /// The plugin or the driver ended it
+    Finished,
+    /// Somebody asked for other devices; this set of streams is closed
+    Reconfigure(super::super::ReconfigureRequest),
+    /// The streams would not open
+    OpenFailed(anyhow::Error),
+}
+
+/// The old devices of a change in progress, kept to be opened again if the new ones fail
+struct Saved {
+    config: WrapperConfig,
+    input: Option<CpalDevice>,
+    output: CpalDevice,
+}
+
+/// A change of devices whose answer has not been sent yet
+struct Trying {
+    reply: std::sync::mpsc::Sender<Result<(), String>>,
+    saved: Saved,
+}
+
+/// Ends the wait of `run` for good, as opposed to waking it for a request
+#[derive(Clone)]
+struct Wake {
+    stopped: Arc<AtomicBool>,
+    unparker: Unparker,
+}
+
+impl Wake {
+    fn unpark(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+        self.unparker.unpark();
+    }
+}
+
+impl CpalMidir {
+    /// Opens the streams, plays until the plugin or the driver ends it or somebody asks for other
+    /// devices, and closes everything it opened
+    fn run_once<P, C>(
+        &mut self,
+        cb: &Arc<Mutex<C>>,
+        parker: &Parker,
+        trying: &mut Option<Trying>,
+    ) -> Outcome
+    where
+        P: Plugin,
+        C: FnMut(
+                &mut Buffer,
+                &mut AuxiliaryBuffers,
+                Transport,
+                &[PluginNoteEvent<P>],
+                &mut Vec<PluginNoteEvent<P>>,
+            ) -> bool
+            + 'static
+            + Send,
+    {
         // So this is a lot of fun. There are up to four separate streams here, all using their own
         // callbacks. The audio output stream acts as the primary stream, and everything else either
         // sends data to it or (in the case of the MIDI output stream) receives data from it using
@@ -141,7 +491,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // realtime unsafe, and to be able to output MIDI with midir you need to transform between
         // `MidiOutputPort` and `MidiOutputPortConnection` types by taking values out of an
         // `Option`.
-        std::thread::scope(|s| {
+        std::thread::scope(|s| -> Outcome {
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
@@ -193,10 +543,15 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     (SampleFormat::F32, f32),
                     (SampleFormat::F64, f64)
                 )
-                .expect("Fatal error creating the capture stream");
-                stream
-                    .play()
-                    .expect("Fatal error trying to start the capture stream");
+                .map_err(anyhow::Error::from)
+                .and_then(|stream| {
+                    stream.play().map_err(anyhow::Error::from)?;
+                    Ok(stream)
+                });
+                let stream = match stream {
+                    Ok(stream) => stream,
+                    Err(err) => return Outcome::OpenFailed(err.context("The capture stream")),
+                };
                 _input_stream = Some(stream);
 
                 // Playback is delayed one period if we're capturing audio so it has something to
@@ -300,13 +655,35 @@ impl<P: Plugin> Backend<P> for CpalMidir {
 
             // This thread needs to be blocked until audio processing ends as CPAL processes the
             // streams on another thread instead of blocking
-            let parker = Parker::new();
-            let unparker = parker.unparker().clone();
+            let wake = Wake {
+                stopped: Arc::new(AtomicBool::new(false)),
+                unparker: parker.unparker().clone(),
+            };
+            let unparker = wake.clone();
             let error_cb = {
-                let unparker = unparker.clone();
+                let unparker = wake.clone();
                 move |err| {
                     nih_error!("Error during playback: {err:#}");
-                    unparker.clone().unpark();
+                    unparker.unpark();
+                }
+            };
+            let shared_cb = {
+                let cb = cb.clone();
+                move |buffer: &mut Buffer,
+                      aux: &mut AuxiliaryBuffers,
+                      transport: Transport,
+                      input_events: &[PluginNoteEvent<P>],
+                      output_events: &mut Vec<PluginNoteEvent<P>>| {
+                    match cb.try_lock() {
+                        Some(mut cb) => cb(buffer, aux, transport, input_events, output_events),
+                        // Never waits: silence for this block instead
+                        None => {
+                            for channel in buffer.as_slice() {
+                                channel.fill(0.0);
+                            }
+                            true
+                        }
+                    }
                 }
             };
 
@@ -322,7 +699,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                                 // This is a MPMC crossbeam channel instead of an rtrb ringbuffer, and we
                                 // also need it to terminate the thread
                                 midi_output_rb_producer.clone(),
-                                cb,
+                                shared_cb,
                             ),
                             error_cb,
                             None,
@@ -344,15 +721,33 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 (SampleFormat::F32, f32),
                 (SampleFormat::F64, f64)
             )
-            .expect("Fatal error creating the output stream");
+            .map_err(anyhow::Error::from)
+            .and_then(|stream| {
+                // TODO: Wait a period before doing this when also reading the input
+                stream.play().map_err(anyhow::Error::from)?;
+                Ok(stream)
+            });
 
-            // TODO: Wait a period before doing this when also reading the input
-            output_stream
-                .play()
-                .expect("Fatal error trying to start the output stream");
+            let outcome = match &output_stream {
+                Ok(_) => {
+                    // The change that was asked for is in place
+                    if let Some(Trying { reply, .. }) = trying.take() {
+                        let _ = reply.send(Ok(()));
+                    }
 
-            // Wait for the audio thread to exit
-            parker.park();
+                    // Wait for the audio thread to exit, or for a request for other devices
+                    loop {
+                        parker.park();
+                        if wake.stopped.load(Ordering::SeqCst) {
+                            break Outcome::Finished;
+                        }
+                        if let Some(request) = super::super::take_reconfigure_request() {
+                            break Outcome::Reconfigure(request);
+                        }
+                    }
+                }
+                Err(err) => Outcome::OpenFailed(anyhow::anyhow!("{err:#}")),
+            };
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -378,7 +773,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         port: midi_output_connection.port,
                     }
                 });
-        });
+
+            // The streams are closed as the scope ends
+            drop(output_stream);
+            outcome
+        })
     }
 }
 
@@ -387,7 +786,7 @@ impl CpalMidir {
     /// reason.
     pub fn new<P: Plugin>(mut config: WrapperConfig, cpal_host_id: cpal::HostId) -> Result<Self> {
         let audio_io_layout = config.audio_io_layout_or_exit::<P>();
-        let host = cpal::host_from_id(cpal_host_id).context("The Audio API is unavailable")?;
+        cpal::host_from_id(cpal_host_id).context("The Audio API is unavailable")?;
 
         if config.input_device.is_none() && audio_io_layout.main_input_channels.is_some() {
             nih_log!(
@@ -403,209 +802,7 @@ impl CpalMidir {
             nih_log!("Use the '--midi-output' option to select a MIDI output device.")
         }
 
-        // No input device is connected unless requested by the user to avoid feedback loops
-        let input_device = config
-            .input_device
-            .as_ref()
-            .map(|name| -> Result<Device> {
-                let device = host
-                    .input_devices()
-                    .context("No audio input devices available")?
-                    // `.name()` returns a `Result` with a non-Eq error type so you can't compare this
-                    // directly
-                    .find(|d| d.name().as_deref().map(|n| n == name).unwrap_or(false))
-                    .with_context(|| {
-                        // This is a bit awkward, but instead of adding a dedicated option we'll just
-                        // list all of the available devices in the error message when the chosen device
-                        // does not exist
-                        let mut message =
-                            format!("Unknown input device '{name}'. Available devices are:");
-                        for device_name in host.input_devices().unwrap().flat_map(|d| d.name()) {
-                            message.push_str(&format!("\n{device_name}"))
-                        }
-
-                        message
-                    })?;
-
-                Ok(device)
-            })
-            .transpose()?;
-
-        let output_device = match config.output_device.as_ref() {
-            Some(name) => host
-                .output_devices()
-                .context("No audio output devices available")?
-                .find(|d| d.name().as_deref().map(|n| n == name).unwrap_or(false))
-                .with_context(|| {
-                    let mut message =
-                        format!("Unknown output device '{name}'. Available devices are:");
-                    for device_name in host.output_devices().unwrap().flat_map(|d| d.name()) {
-                        message.push_str(&format!("\n{device_name}"))
-                    }
-
-                    message
-                })?,
-            None => host
-                .default_output_device()
-                .context("No default audio output device available")?,
-        };
-
-        // An ASIO driver is opened once and takes one set of buffers for its inputs and its
-        // outputs together. Two `Device`s for the same driver each prepare buffers of their own,
-        // and the second takes the first's away, so the input never delivers a block. With one
-        // driver for both, input and output share one `Device`
-        #[cfg(feature = "asio")]
-        let output_device = match (&input_device, cpal_host_id) {
-            (Some(input), cpal::HostId::Asio)
-                if input.name().ok().is_some()
-                    && input.name().ok() == output_device.name().ok() =>
-            {
-                input.clone()
-            }
-            _ => output_device,
-        };
-
-        // The channels are counted from 1 on the command line, from 0 here
-        let input_first_channel = config.input_channel.saturating_sub(1) as usize;
-        let output_first_channel = config.output_channel.saturating_sub(1) as usize;
-        let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
-        // An ASIO driver has the buffer size it was set to in its own control panel (a Focusrite
-        // reports 64 as both its smallest and its largest while it is set to 64), so the size
-        // asked for is brought into the driver's range instead of failing to start
-        #[cfg(feature = "asio")]
-        if cpal_host_id == cpal::HostId::Asio {
-            if let Some(cpal::SupportedBufferSize::Range { min, max }) = output_device
-                .supported_output_configs()
-                .ok()
-                .and_then(|mut configs| configs.next())
-                .map(|c| *c.buffer_size())
-            {
-                let size = config.period_size.clamp(min, max);
-                if size != config.period_size {
-                    nih_log!(
-                        "The ASIO driver takes buffers of {min} to {max} samples: using {size}                          instead of {}",
-                        config.period_size
-                    );
-                    config.period_size = size;
-                }
-            }
-        }
-        let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
-        let num_input_channels = audio_io_layout
-            .main_input_channels
-            .map(NonZeroU32::get)
-            .unwrap_or_default() as usize;
-        let input = input_device
-            .map(|device| -> Result<CpalDevice> {
-                let mut input_configs: Vec<_> = device
-                    .supported_input_configs()
-                    .context("Could not get supported audio input configurations")?
-                    .filter(|c| match c.buffer_size() {
-                        cpal::SupportedBufferSize::Range { min, max } => {
-                            c.channels() as usize >= input_first_channel + num_input_channels
-                                && (c.min_sample_rate()..=c.max_sample_rate())
-                                    .contains(&requested_sample_rate)
-                                && (min..=max).contains(&&config.period_size)
-                        }
-                        cpal::SupportedBufferSize::Unknown => false,
-                    })
-                    .collect();
-                // The fewest channels that reach the chosen ones
-                input_configs.sort_by_key(|c| c.channels());
-                let input_config_range = input_configs
-                    .iter()
-                    // Prefer floating point samples to avoid conversions
-                    .find(|c| {
-                        c.sample_format() == SampleFormat::F32
-                            && c.channels() == input_configs[0].channels()
-                    })
-                    .or_else(|| input_configs.first())
-                    .cloned()
-                    .with_context(|| {
-                        format!(
-                            "The audio input device does not have {} audio channels from \
-                             channel {} at a sample rate of {} Hz and a period size of {} samples",
-                            num_input_channels,
-                            config.input_channel,
-                            config.sample_rate,
-                            config.period_size,
-                        )
-                    })?;
-
-                // We already checked that these settings are valid
-                let input_config = StreamConfig {
-                    channels: asio_channels(
-                        cpal_host_id,
-                        input_config_range.channels(),
-                        input_first_channel + num_input_channels,
-                    ),
-                    sample_rate: requested_sample_rate,
-                    buffer_size: requested_buffer_size,
-                };
-                let input_sample_format = input_config_range.sample_format();
-
-                Ok(CpalDevice {
-                    device,
-                    config: input_config,
-                    sample_format: input_sample_format,
-                })
-            })
-            .transpose()?;
-
-        let num_output_channels = audio_io_layout
-            .main_output_channels
-            .map(NonZeroU32::get)
-            .unwrap_or_default() as usize;
-        let output = {
-            let mut output_configs: Vec<_> = output_device
-                .supported_output_configs()
-                .context("Could not get supported audio output configurations")?
-                .filter(|c| match c.buffer_size() {
-                    cpal::SupportedBufferSize::Range { min, max } => {
-                        c.channels() as usize >= output_first_channel + num_output_channels
-                            && (c.min_sample_rate()..=c.max_sample_rate())
-                                .contains(&requested_sample_rate)
-                            && (min..=max).contains(&&config.period_size)
-                    }
-                    cpal::SupportedBufferSize::Unknown => false,
-                })
-                .collect();
-            output_configs.sort_by_key(|c| c.channels());
-            let output_config_range = output_configs
-                .iter()
-                .find(|c| {
-                    c.sample_format() == SampleFormat::F32
-                        && c.channels() == output_configs[0].channels()
-                })
-                .or_else(|| output_configs.first())
-                .cloned()
-                .with_context(|| {
-                    format!(
-                        "The audio output device does not have {} audio channels from channel {} \
-                         at a sample rate of {} Hz and a period size of {} samples",
-                        num_output_channels,
-                        config.output_channel,
-                        config.sample_rate,
-                        config.period_size,
-                    )
-                })?;
-            let output_config = StreamConfig {
-                channels: asio_channels(
-                    cpal_host_id,
-                    output_config_range.channels(),
-                    output_first_channel + num_output_channels,
-                ),
-                sample_rate: requested_sample_rate,
-                buffer_size: requested_buffer_size,
-            };
-            let output_sample_format = output_config_range.sample_format();
-
-            CpalDevice {
-                device: output_device,
-                config: output_config,
-                sample_format: output_sample_format,
-            }
-        };
+        let (input, output) = open_devices(&mut config, &audio_io_layout, cpal_host_id)?;
 
         // There's no obvious way to do sidechain inputs and additional outputs with the CPAL
         // backends like there is with JACK. So we'll just provide empty buffers instead.
@@ -702,6 +899,7 @@ impl CpalMidir {
             config,
             audio_io_layout,
 
+            host_id: cpal_host_id,
             input,
             output,
 
@@ -781,7 +979,7 @@ impl CpalMidir {
 
     fn build_output_data_callback<P, T>(
         &self,
-        unparker: Unparker,
+        unparker: Wake,
         mut input_rb_consumer: Option<rtrb::Consumer<f32>>,
         mut input_event_rb_consumer: Option<rtrb::Consumer<PluginNoteEvent<P>>>,
         mut output_event_rb_producer: Option<crossbeam::channel::Sender<MidiOutputTask<P>>>,
