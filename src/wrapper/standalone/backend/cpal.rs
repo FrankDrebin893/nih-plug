@@ -379,14 +379,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         }
                     }
                 }
-                Outcome::OpenFailed(err) => {
+                Outcome::OpenFailed(err, worth_retrying) => {
                     if !opened_once {
                         super::super::set_reconfigure_waker(None);
                         panic!("Fatal error opening the audio streams: {err:#}");
                     }
                     nih_error!("Could not open the audio streams: {err:#}");
                     // An ASIO driver may need a moment to let go of what it had before
-                    if retries < OPEN_RETRIES {
+                    if worth_retrying && retries < OPEN_RETRIES {
                         retries += 1;
                         std::thread::sleep(OPEN_RETRY_WAIT);
                         continue;
@@ -445,7 +445,9 @@ enum Outcome {
     /// Somebody asked for other devices; this set of streams is closed
     Reconfigure(super::super::ReconfigureRequest),
     /// The streams would not open
-    OpenFailed(anyhow::Error),
+    /// The streams would not open. Whether a short wait and another try may help: not for a
+    /// capture device that is open but delivers nothing, which took seconds to find out
+    OpenFailed(anyhow::Error, bool),
 }
 
 /// The old devices of a change in progress, kept to be opened again if the new ones fail
@@ -463,6 +465,15 @@ struct Trying {
     reply: std::sync::mpsc::Sender<Result<(), String>>,
     saved: Option<Saved>,
     result: Result<(), String>,
+}
+
+/// Sets the flag when dropped
+struct CloseOnDrop(Arc<AtomicBool>);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Ends the wait of `run` for good, as opposed to waking it for a request
@@ -527,6 +538,9 @@ impl CpalMidir {
         let closing = Arc::new(AtomicBool::new(false));
         std::thread::scope(|s| -> Outcome {
             let mut _input_stream: Option<Stream> = None;
+            // Declared after the stream, so dropped before it: however this scope ends (an early
+            // return included), `closing` is set before the capture stream is dropped
+            let _close_on_drop = CloseOnDrop(closing.clone());
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
             if let Some(input) = &self.input {
                 // Data is sent to the output data callback using a wait-free ring buffer
@@ -585,7 +599,9 @@ impl CpalMidir {
                 });
                 let stream = match stream {
                     Ok(stream) => stream,
-                    Err(err) => return Outcome::OpenFailed(err.context("The capture stream")),
+                    Err(err) => {
+                        return Outcome::OpenFailed(err.context("The capture stream"), true)
+                    }
                 };
                 _input_stream = Some(stream);
 
@@ -595,9 +611,10 @@ impl CpalMidir {
                 if trying.is_some() {
                     input_parker.park_timeout(CAPTURE_START_TIMEOUT);
                     if input_rb_consumer.as_ref().is_some_and(|rb| rb.is_empty()) {
-                        return Outcome::OpenFailed(anyhow::anyhow!(
-                            "The capture device delivered no audio"
-                        ));
+                        return Outcome::OpenFailed(
+                            anyhow::anyhow!("The capture device delivered no audio"),
+                            false,
+                        );
                     }
                 } else {
                     input_parker.park()
@@ -792,7 +809,7 @@ impl CpalMidir {
                         }
                     }
                 }
-                Err(err) => Outcome::OpenFailed(anyhow::anyhow!("{err:#}")),
+                Err(err) => Outcome::OpenFailed(anyhow::anyhow!("{err:#}"), true),
             };
 
             // Nothing waits on another callback from here on: dropping a stream waits for its
@@ -1149,18 +1166,9 @@ impl CpalMidir {
                         let frames = chunk_len;
                         for frame in 0..frames {
                             for channel in main_io_storage.iter_mut().take(num_input_channels) {
-                                loop {
-                                    // Keep spinning on this if the output callback somehow outpaces the
-                                    // input callback (until the streams are closing)
-                                    if let Ok(input_sample) = input_rb_consumer.pop() {
-                                        channel[frame] = input_sample;
-                                        break;
-                                    }
-                                    if unparker.closing.load(Ordering::Relaxed) {
-                                        channel[frame] = 0.0;
-                                        break;
-                                    }
-                                }
+                                // Waits if the output callback somehow outpaces the input callback,
+                                // until the streams are closing
+                                channel[frame] = pop_sample(input_rb_consumer, &unparker.closing);
                             }
                         }
                     }
@@ -1325,6 +1333,20 @@ fn push_sample(
     true
 }
 
+/// The next captured sample for the output callback, waiting for the capture callback if it has
+/// not delivered it yet. The wait ends when the streams are closing: silence then
+fn pop_sample(consumer: &mut rtrb::Consumer<f32>, closing: &AtomicBool) -> f32 {
+    loop {
+        if let Ok(sample) = consumer.pop() {
+            return sample;
+        }
+        if closing.load(Ordering::Relaxed) {
+            return 0.0;
+        }
+        std::hint::spin_loop();
+    }
+}
+
 fn num_input_channels_of(layout: &AudioIOLayout) -> usize {
     layout.main_input_channels.map(NonZeroU32::get).unwrap_or(0) as usize
 }
@@ -1398,6 +1420,28 @@ mod push_tests {
             Ok(false),
             "it returns, dropping the sample, once the streams are closing"
         );
+        waiting.join().unwrap();
+    }
+
+    /// The output callback waiting for a captured sample that does not come returns silence once
+    /// the streams are closing
+    #[test]
+    fn an_output_callback_waiting_on_an_empty_buffer_returns_silence_when_closing() {
+        let (mut producer, mut consumer) = RingBuffer::new(2);
+        let closing = Arc::new(AtomicBool::new(false));
+        producer.push(0.5).unwrap();
+        assert_eq!(super::pop_sample(&mut consumer, &closing), 0.5);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let waiting = {
+            let closing = closing.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(super::pop_sample(&mut consumer, &closing));
+            })
+        };
+        assert!(finished.recv_timeout(Duration::from_millis(100)).is_err());
+        closing.store(true, Ordering::SeqCst);
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok(0.0));
         waiting.join().unwrap();
     }
 
