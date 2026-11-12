@@ -369,7 +369,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             };
                             trying = Some(Trying {
                                 reply: request.reply,
-                                saved,
+                                saved: Some(saved),
+                                result: Ok(()),
                             });
                         }
                         // The old devices have been let go, so they are opened again
@@ -392,12 +393,34 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     }
                     retries = 0;
                     match trying.take() {
-                        // The new devices will not open: the old ones play again
-                        Some(Trying { reply, saved }) => {
+                        // The new devices will not open: the old ones are opened again, and the
+                        // answer is the error once that has worked
+                        Some(Trying {
+                            reply,
+                            saved: Some(saved),
+                            ..
+                        }) => {
                             self.config = saved.config;
                             self.input = saved.input;
                             self.output = saved.output;
-                            let _ = reply.send(Err(format!("{err:#}")));
+                            trying = Some(Trying {
+                                reply,
+                                saved: None,
+                                result: Err(format!("{err:#}")),
+                            });
+                        }
+                        // The old ones will not open either: say so, and end, instead of
+                        // going silent without a word
+                        Some(Trying {
+                            reply,
+                            saved: None,
+                            result,
+                        }) => {
+                            let first = result.err().unwrap_or_default();
+                            let _ = reply.send(Err(format!(
+                                "{first}; the old devices would not open again either: {err:#}"
+                            )));
+                            break;
                         }
                         None => break,
                     }
@@ -429,10 +452,14 @@ struct Saved {
     output: CpalDevice,
 }
 
-/// A change of devices whose answer has not been sent yet
+/// A change of devices whose answer has not been sent yet. It is sent once streams are open
+/// again: `result` is what it says then (`Ok` for the new devices; an error when the new ones
+/// failed and the old ones are being opened again). `saved` holds the old devices while the new
+/// ones are tried
 struct Trying {
     reply: std::sync::mpsc::Sender<Result<(), String>>,
-    saved: Saved,
+    saved: Option<Saved>,
+    result: Result<(), String>,
 }
 
 /// Ends the wait of `run` for good, as opposed to waking it for a request
@@ -731,8 +758,8 @@ impl CpalMidir {
             let outcome = match &output_stream {
                 Ok(_) => {
                     // The change that was asked for is in place
-                    if let Some(Trying { reply, .. }) = trying.take() {
-                        let _ = reply.send(Ok(()));
+                    if let Some(Trying { reply, result, .. }) = trying.take() {
+                        let _ = reply.send(result);
                     }
 
                     // Wait for the audio thread to exit, or for a request for other devices

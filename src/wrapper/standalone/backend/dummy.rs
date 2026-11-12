@@ -102,7 +102,7 @@ impl<P: Plugin> Backend<P> for Dummy {
         super::super::set_reconfigure_waker(Some(parker.unparker().clone()));
         loop {
             if let Some(request) = super::super::take_reconfigure_request() {
-                let _ = request.reply.send(Ok(()));
+                let _ = request.reply.send(Self::check_devices(&request.devices));
             }
             let period_start = Instant::now();
 
@@ -187,6 +187,26 @@ impl<P: Plugin> Backend<P> for Dummy {
 }
 
 impl Dummy {
+    /// The name of the one device this backend pretends to have
+    pub const DEVICE: &'static str = "Dummy";
+
+    /// A request for devices is answered as a real backend does: a device that does not exist
+    /// is an error, and what played before plays on
+    fn check_devices(devices: &super::super::StandaloneDevices) -> Result<(), String> {
+        for (kind, name) in [
+            ("input", &devices.input_device),
+            ("output", &devices.output_device),
+        ] {
+            match name {
+                Some(name) if name != Self::DEVICE => {
+                    return Err(format!("Unknown {kind} device '{name}'"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub fn new<P: Plugin>(config: WrapperConfig) -> Self {
         Self {
             audio_io_layout: config.audio_io_layout_or_exit::<P>(),

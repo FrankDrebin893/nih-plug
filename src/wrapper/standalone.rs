@@ -393,7 +393,7 @@ mod reconfigure_tests {
         wait_for(|| BLOCKS.load(Ordering::SeqCst) > 3);
 
         let devices = StandaloneDevices {
-            output_device: Some("Other".into()),
+            output_device: Some("Dummy".into()),
             input_channel: 1,
             output_channel: 3,
             ..StandaloneDevices::default()
@@ -409,6 +409,21 @@ mod reconfigure_tests {
             1,
             "devices changing is not a new initialize"
         );
+
+        // A device that is not there is an error, and what played goes on playing
+        let answer = nih_standalone_reconfigure(StandaloneDevices {
+            output_device: Some("Missing".into()),
+            ..StandaloneDevices::default()
+        })
+        .expect("the host takes requests");
+        let error = answer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("an answer")
+            .expect_err("a device that is not there");
+        assert!(error.contains("Missing"), "{error}");
+        let after = BLOCKS.load(Ordering::SeqCst);
+        wait_for(|| BLOCKS.load(Ordering::SeqCst) > after + 3);
+        assert_eq!(INITIALIZED.load(Ordering::SeqCst), 1);
 
         STOP.store(true, Ordering::SeqCst);
         // The audio ends with the plugin's error; a host without an editor then blocks until it
