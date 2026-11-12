@@ -274,10 +274,6 @@ pub struct CpalMidir {
 
     midi_input: Mutex<Option<MidirInputDevice>>,
     midi_output: Mutex<Option<MidirOutputDevice>>,
-
-    /// The capture and playback callbacks run one after the other on the driver's thread
-    /// (ASIO), so the capture callback must never wait for the playback one
-    one_callback_thread: bool,
 }
 
 /// All data needed for a CPAL input or output stream.
@@ -583,7 +579,7 @@ impl CpalMidir {
                 // Only the channels the plugin reads go through it
                 let (rb_producer, rb_consumer) = RingBuffer::new(
                     num_input_channels_of(&self.audio_io_layout).max(1)
-                        * self.config.period_size as usize,
+                        * input_ring_frames(self.config.period_size as usize),
                 );
                 input_rb_consumer = Some(rb_consumer);
 
@@ -606,7 +602,6 @@ impl CpalMidir {
                                     input_unparker,
                                     rb_producer,
                                     input.config.channels as usize,
-                                    closing.clone(),
                                 ),
                                 error_cb,
                                 None,
@@ -1045,14 +1040,6 @@ impl CpalMidir {
 
             midi_input: Mutex::new(midi_input),
             midi_output: Mutex::new(midi_output),
-
-            one_callback_thread: {
-                #[cfg(feature = "asio")]
-                let asio = cpal_host_id == cpal::HostId::Asio;
-                #[cfg(not(feature = "asio"))]
-                let asio = false;
-                asio
-            },
         })
     }
 
@@ -1061,7 +1048,6 @@ impl CpalMidir {
         input_unparker: Unparker,
         mut input_rb_producer: rtrb::Producer<f32>,
         stream_channels: usize,
-        closing: Arc<AtomicBool>,
     ) -> impl FnMut(&[T], &InputCallbackInfo) + Send + 'static
     where
         T: Sample,
@@ -1079,27 +1065,28 @@ impl CpalMidir {
             .main_input_channels
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
-        let one_callback_thread = self.one_callback_thread;
         let mut first_block = true;
+        let mut dropped = 0usize;
+        let mut dropped_traced = false;
         move |data, _info| {
             if first_block {
                 first_block = false;
                 rtrace!("capture callback: first block, {} samples", data.len());
             }
+            // The callback never waits for room: WASAPI's shared mode ignores the buffer size and
+            // may deliver far more than a period at once, and a callback that waited for the
+            // output (not yet built, as it starts after this one returns) never returned. What
+            // does not fit is dropped and counted
             for frame in data.chunks_exact(stream_channels) {
                 for sample in &frame[first..first + width] {
-                    // If for whatever reason the input callback is fired twice before an output
-                    // callback, then just spin on this until the push succeeds
-                    // (With one thread for both callbacks that would wait for ever: the playback
-                    // callback that frees the room runs after this one, so a sample that does
-                    // not fit is dropped)
-                    push_sample(
-                        &mut input_rb_producer,
-                        sample.to_sample(),
-                        one_callback_thread,
-                        &closing,
-                    );
+                    if !push_sample(&mut input_rb_producer, sample.to_sample()) {
+                        dropped += 1;
+                    }
                 }
+            }
+            if dropped > 0 && !dropped_traced {
+                dropped_traced = true;
+                rtrace!("capture callback: the ring was full, {dropped} samples dropped so far");
             }
 
             // The run function is blocked until a single period has been processed here. After this
@@ -1406,24 +1393,18 @@ impl CpalMidir {
     }
 }
 
-/// Puts one captured sample in the ring buffer, waiting for room if the output callback has not
-/// made it yet. The wait ends when the streams are closing (the sample is dropped): the output
-/// callback that makes room may be gone, and dropping the capture stream waits for this callback
-/// to return. With one thread for both callbacks a sample that does not fit is dropped at once.
-/// Returns whether the sample went in.
-fn push_sample(
-    producer: &mut rtrb::Producer<f32>,
-    sample: f32,
-    one_callback_thread: bool,
-    closing: &AtomicBool,
-) -> bool {
-    while producer.push(sample).is_err() {
-        if one_callback_thread || closing.load(Ordering::Relaxed) {
-            return false;
-        }
-        std::hint::spin_loop();
-    }
-    true
+/// Puts one captured sample in the ring buffer. Never waits: when there is no room the sample is
+/// dropped (returns false). Waiting for the output callback to make room hung the first start when
+/// a capture callback delivered more than the ring held, since the output is only built once the
+/// first capture callback has returned.
+fn push_sample(producer: &mut rtrb::Producer<f32>, sample: f32) -> bool {
+    producer.push(sample).is_ok()
+}
+
+/// Frames the capture ring holds: several periods, and at least what a shared-mode WASAPI
+/// callback (which ignores the period) delivers at once
+fn input_ring_frames(period_size: usize) -> usize {
+    (period_size * 8).max(8192)
 }
 
 /// How long the output callback waits for one captured sample at most, once per block
@@ -1496,38 +1477,29 @@ mod chunk_tests {
 mod push_tests {
     use super::push_sample;
     use rtrb::RingBuffer;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
-    /// A capture callback waiting for room in a full ring buffer must return once the streams are
-    /// closing, or dropping the capture stream waits for it for ever
+    /// A capture block bigger than the ring (WASAPI's shared mode ignores the period) must never
+    /// make the callback wait: the output is built only after it returns
     #[test]
-    fn a_capture_callback_waiting_on_a_full_buffer_returns_when_closing() {
-        let (mut producer, _consumer) = RingBuffer::new(1);
-        let closing = Arc::new(AtomicBool::new(false));
-        assert!(push_sample(&mut producer, 0.5, false, &closing));
-
+    fn a_capture_block_bigger_than_the_ring_returns_at_once_dropping_the_excess() {
+        let (mut producer, mut consumer) = RingBuffer::new(128);
         let (done, finished) = std::sync::mpsc::channel();
-        let waiting = {
-            let closing = closing.clone();
-            std::thread::spawn(move || {
-                // The buffer is full and nobody reads it
-                let went_in = push_sample(&mut producer, 0.25, false, &closing);
-                let _ = done.send(went_in);
-            })
-        };
-        assert!(
-            finished.recv_timeout(Duration::from_millis(100)).is_err(),
-            "it waits for room while the streams run"
-        );
-        closing.store(true, Ordering::SeqCst);
-        assert_eq!(
-            finished.recv_timeout(Duration::from_secs(5)),
-            Ok(false),
-            "it returns, dropping the sample, once the streams are closing"
-        );
-        waiting.join().unwrap();
+        std::thread::spawn(move || {
+            let went_in = (0..960)
+                .filter(|i| push_sample(&mut producer, *i as f32))
+                .count();
+            let _ = done.send(went_in);
+        });
+        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok(128));
+        assert_eq!(consumer.pop(), Ok(0.0));
+    }
+
+    #[test]
+    fn the_ring_holds_a_shared_mode_callback_of_two_channels() {
+        // 960 samples at 2 channels = 480 frames
+        assert!(super::input_ring_frames(64) >= 960);
     }
 
     /// The output callback never waits long for a captured sample: a stream's own thread answers
@@ -1574,13 +1546,5 @@ mod push_tests {
         let start = std::time::Instant::now();
         assert_eq!(super::pop_sample(&mut consumer, &closing, &mut false), 0.0);
         assert!(start.elapsed() < Duration::from_millis(50));
-    }
-
-    #[test]
-    fn one_callback_thread_never_waits() {
-        let (mut producer, _consumer) = RingBuffer::new(1);
-        let closing = AtomicBool::new(false);
-        assert!(push_sample(&mut producer, 0.5, true, &closing));
-        assert!(!push_sample(&mut producer, 0.25, true, &closing));
     }
 }
