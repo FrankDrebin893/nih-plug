@@ -431,6 +431,9 @@ impl<P: Plugin> Backend<P> for CpalMidir {
     }
 }
 
+/// How long a change of devices waits for the new capture device's first block
+const CAPTURE_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// How often and how long an opening is tried again after a change of devices
 const OPEN_RETRIES: u32 = 10;
 const OPEN_RETRY_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -466,6 +469,9 @@ struct Trying {
 #[derive(Clone)]
 struct Wake {
     stopped: Arc<AtomicBool>,
+    /// Set before any stream is dropped. A callback that waits for the other (a full ring buffer,
+    /// an empty one) stops waiting then, since dropping a stream waits for its callback to return
+    closing: Arc<AtomicBool>,
     unparker: Unparker,
 }
 
@@ -518,6 +524,7 @@ impl CpalMidir {
         // realtime unsafe, and to be able to output MIDI with midir you need to transform between
         // `MidiOutputPort` and `MidiOutputPortConnection` types by taking values out of an
         // `Option`.
+        let closing = Arc::new(AtomicBool::new(false));
         std::thread::scope(|s| -> Outcome {
             let mut _input_stream: Option<Stream> = None;
             let mut input_rb_consumer: Option<rtrb::Consumer<f32>> = None;
@@ -549,6 +556,7 @@ impl CpalMidir {
                                     input_unparker,
                                     rb_producer,
                                     input.config.channels as usize,
+                                    closing.clone(),
                                 ),
                                 error_cb,
                                 None,
@@ -582,8 +590,18 @@ impl CpalMidir {
                 _input_stream = Some(stream);
 
                 // Playback is delayed one period if we're capturing audio so it has something to
-                // process
-                input_parker.park()
+                // process. When the devices are being changed a capture device that delivers
+                // nothing is an error to answer, not a wait for ever
+                if trying.is_some() {
+                    input_parker.park_timeout(CAPTURE_START_TIMEOUT);
+                    if input_rb_consumer.as_ref().is_some_and(|rb| rb.is_empty()) {
+                        return Outcome::OpenFailed(anyhow::anyhow!(
+                            "The capture device delivered no audio"
+                        ));
+                    }
+                } else {
+                    input_parker.park()
+                }
             }
 
             // The output callback can read input events from this ringbuffer
@@ -684,6 +702,7 @@ impl CpalMidir {
             // streams on another thread instead of blocking
             let wake = Wake {
                 stopped: Arc::new(AtomicBool::new(false)),
+                closing: closing.clone(),
                 unparker: parker.unparker().clone(),
             };
             let unparker = wake.clone();
@@ -775,6 +794,11 @@ impl CpalMidir {
                 }
                 Err(err) => Outcome::OpenFailed(anyhow::anyhow!("{err:#}")),
             };
+
+            // Nothing waits on another callback from here on: dropping a stream waits for its
+            // callback to return, and a capture callback may be waiting for room that the output
+            // callback (dropped first, or never started) no longer makes
+            closing.store(true, Ordering::SeqCst);
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -948,6 +972,7 @@ impl CpalMidir {
         input_unparker: Unparker,
         mut input_rb_producer: rtrb::Producer<f32>,
         stream_channels: usize,
+        closing: Arc<AtomicBool>,
     ) -> impl FnMut(&[T], &InputCallbackInfo) + Send + 'static
     where
         T: Sample,
@@ -974,11 +999,12 @@ impl CpalMidir {
                     // (With one thread for both callbacks that would wait for ever: the playback
                     // callback that frees the room runs after this one, so a sample that does
                     // not fit is dropped)
-                    while input_rb_producer.push(sample.to_sample()).is_err() {
-                        if one_callback_thread {
-                            break;
-                        }
-                    }
+                    push_sample(
+                        &mut input_rb_producer,
+                        sample.to_sample(),
+                        one_callback_thread,
+                        &closing,
+                    );
                 }
             }
 
@@ -1125,9 +1151,13 @@ impl CpalMidir {
                             for channel in main_io_storage.iter_mut().take(num_input_channels) {
                                 loop {
                                     // Keep spinning on this if the output callback somehow outpaces the
-                                    // input callback
+                                    // input callback (until the streams are closing)
                                     if let Ok(input_sample) = input_rb_consumer.pop() {
                                         channel[frame] = input_sample;
+                                        break;
+                                    }
+                                    if unparker.closing.load(Ordering::Relaxed) {
+                                        channel[frame] = 0.0;
                                         break;
                                     }
                                 }
@@ -1275,6 +1305,26 @@ impl CpalMidir {
     }
 }
 
+/// Puts one captured sample in the ring buffer, waiting for room if the output callback has not
+/// made it yet. The wait ends when the streams are closing (the sample is dropped): the output
+/// callback that makes room may be gone, and dropping the capture stream waits for this callback
+/// to return. With one thread for both callbacks a sample that does not fit is dropped at once.
+/// Returns whether the sample went in.
+fn push_sample(
+    producer: &mut rtrb::Producer<f32>,
+    sample: f32,
+    one_callback_thread: bool,
+    closing: &AtomicBool,
+) -> bool {
+    while producer.push(sample).is_err() {
+        if one_callback_thread || closing.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::hint::spin_loop();
+    }
+    true
+}
+
 fn num_input_channels_of(layout: &AudioIOLayout) -> usize {
     layout.main_input_channels.map(NonZeroU32::get).unwrap_or(0) as usize
 }
@@ -1310,5 +1360,52 @@ mod chunk_tests {
             vec![512, 512, 76]
         );
         assert_eq!(chunk_lengths(0, 512).count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::push_sample;
+    use rtrb::RingBuffer;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// A capture callback waiting for room in a full ring buffer must return once the streams are
+    /// closing, or dropping the capture stream waits for it for ever
+    #[test]
+    fn a_capture_callback_waiting_on_a_full_buffer_returns_when_closing() {
+        let (mut producer, _consumer) = RingBuffer::new(1);
+        let closing = Arc::new(AtomicBool::new(false));
+        assert!(push_sample(&mut producer, 0.5, false, &closing));
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let waiting = {
+            let closing = closing.clone();
+            std::thread::spawn(move || {
+                // The buffer is full and nobody reads it
+                let went_in = push_sample(&mut producer, 0.25, false, &closing);
+                let _ = done.send(went_in);
+            })
+        };
+        assert!(
+            finished.recv_timeout(Duration::from_millis(100)).is_err(),
+            "it waits for room while the streams run"
+        );
+        closing.store(true, Ordering::SeqCst);
+        assert_eq!(
+            finished.recv_timeout(Duration::from_secs(5)),
+            Ok(false),
+            "it returns, dropping the sample, once the streams are closing"
+        );
+        waiting.join().unwrap();
+    }
+
+    #[test]
+    fn one_callback_thread_never_waits() {
+        let (mut producer, _consumer) = RingBuffer::new(1);
+        let closing = AtomicBool::new(false);
+        assert!(push_sample(&mut producer, 0.5, true, &closing));
+        assert!(!push_sample(&mut producer, 0.25, true, &closing));
     }
 }
