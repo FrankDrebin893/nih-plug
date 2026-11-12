@@ -25,6 +25,15 @@ use crate::prelude::{
 };
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
+/// TEMPORARY, to find a hang on a change of devices: a timestamped trace line (stderr and file)
+macro_rules! rtrace {
+    ($($t:tt)*) => { super::super::trace(format_args!($($t)*)) };
+}
+
+fn device_name(device: &Device) -> String {
+    device.name().unwrap_or_else(|_| "?".into())
+}
+
 const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
 
 /// An ASIO stream takes over every channel it opens, so it opens only the ones the plugin uses
@@ -343,6 +352,12 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // the same callback. Only an output callback calls it, and only one set of streams
         // exists at a time, so the lock is never contended
         let cb = Arc::new(Mutex::new(cb));
+        rtrace!(
+            "run: start, host {:?}, input {:?}, output {}",
+            self.host_id,
+            self.input.as_ref().map(|d| device_name(&d.device)),
+            device_name(&self.output.device)
+        );
         let parker = Parker::new();
         super::super::set_reconfigure_waker(Some(parker.unparker().clone()));
 
@@ -350,9 +365,17 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         let mut retries = 0;
         let mut opened_once = false;
         loop {
+            rtrace!(
+                "run: opening streams (opened before: {opened_once}, change in progress: {})",
+                trying.is_some()
+            );
             match self.run_once::<P, _>(&cb, &parker, &mut trying) {
-                Outcome::Finished => break,
+                Outcome::Finished => {
+                    rtrace!("run: the streams finished");
+                    break;
+                }
                 Outcome::Reconfigure(request) => {
+                    rtrace!("run: streams closed for a request: {:?}", request.devices);
                     opened_once = true;
                     retries = 0;
                     let mut config = self.config.clone();
@@ -360,8 +383,14 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     config.output_device = request.devices.output_device.clone();
                     config.input_channel = request.devices.input_channel.max(1);
                     config.output_channel = request.devices.output_channel.max(1);
+                    rtrace!("run: resolving the new devices");
                     match open_devices(&mut config, &self.audio_io_layout, self.host_id) {
                         Ok((input, output)) => {
+                            rtrace!(
+                                "run: devices resolved, input {:?}, output {}",
+                                input.as_ref().map(|d| device_name(&d.device)),
+                                device_name(&output.device)
+                            );
                             let saved = Saved {
                                 config: std::mem::replace(&mut self.config, config),
                                 input: std::mem::replace(&mut self.input, input),
@@ -375,11 +404,15 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         }
                         // The old devices have been let go, so they are opened again
                         Err(err) => {
+                            rtrace!("run: the new devices could not be resolved: {err:#}");
                             let _ = request.reply.send(Err(format!("{err:#}")));
                         }
                     }
                 }
                 Outcome::OpenFailed(err, worth_retrying) => {
+                    rtrace!(
+                        "run: open failed ({err:#}), worth retrying {worth_retrying}, retry {retries}"
+                    );
                     if !opened_once {
                         super::super::set_reconfigure_waker(None);
                         panic!("Fatal error opening the audio streams: {err:#}");
@@ -400,6 +433,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             saved: Some(saved),
                             ..
                         }) => {
+                            rtrace!("run: the new devices failed, the old ones are opened again");
                             self.config = saved.config;
                             self.input = saved.input;
                             self.output = saved.output;
@@ -416,6 +450,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             saved: None,
                             result,
                         }) => {
+                            rtrace!("run: the old devices failed too");
                             let first = result.err().unwrap_or_default();
                             let _ = reply.send(Err(format!(
                                 "{first}; the old devices would not open again either: {err:#}"
@@ -427,6 +462,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 }
             }
         }
+        rtrace!("run: end");
         super::super::set_reconfigure_waker(None);
     }
 }
@@ -579,6 +615,12 @@ impl CpalMidir {
                         }
                     }
                 }
+                rtrace!(
+                    "capture: building a stream on {} ({:?}, {:?})",
+                    device_name(&input.device),
+                    input.config,
+                    input.sample_format
+                );
                 let stream = build_input_streams!(
                     input.sample_format,
                     (SampleFormat::I8, i8),
@@ -594,7 +636,9 @@ impl CpalMidir {
                 )
                 .map_err(anyhow::Error::from)
                 .and_then(|stream| {
+                    rtrace!("capture: stream built, play() called");
                     stream.play().map_err(anyhow::Error::from)?;
+                    rtrace!("capture: play() returned");
                     Ok(stream)
                 });
                 let stream = match stream {
@@ -608,8 +652,13 @@ impl CpalMidir {
                 // Playback is delayed one period if we're capturing audio so it has something to
                 // process. When the devices are being changed a capture device that delivers
                 // nothing is an error to answer, not a wait for ever
+                rtrace!("capture: waiting for the first block");
                 if trying.is_some() {
                     input_parker.park_timeout(CAPTURE_START_TIMEOUT);
+                    rtrace!(
+                        "capture: wait over, ring empty: {}",
+                        input_rb_consumer.as_ref().is_some_and(|rb| rb.is_empty())
+                    );
                     if input_rb_consumer.as_ref().is_some_and(|rb| rb.is_empty()) {
                         return Outcome::OpenFailed(
                             anyhow::anyhow!("The capture device delivered no audio"),
@@ -617,7 +666,8 @@ impl CpalMidir {
                         );
                     }
                 } else {
-                    input_parker.park()
+                    input_parker.park();
+                    rtrace!("capture: the first block came");
                 }
             }
 
@@ -771,6 +821,12 @@ impl CpalMidir {
                     }
                 }
             }
+            rtrace!(
+                "playback: building a stream on {} ({:?}, {:?})",
+                device_name(&self.output.device),
+                self.output.config,
+                self.output.sample_format
+            );
             let output_stream = build_output_streams!(
                 self.output.sample_format,
                 (SampleFormat::I8, i8),
@@ -787,7 +843,9 @@ impl CpalMidir {
             .map_err(anyhow::Error::from)
             .and_then(|stream| {
                 // TODO: Wait a period before doing this when also reading the input
+                rtrace!("playback: stream built, play() called");
                 stream.play().map_err(anyhow::Error::from)?;
+                rtrace!("playback: play() returned");
                 Ok(stream)
             });
 
@@ -795,12 +853,18 @@ impl CpalMidir {
                 Ok(_) => {
                     // The change that was asked for is in place
                     if let Some(Trying { reply, result, .. }) = trying.take() {
+                        rtrace!("playback: answer sent: {result:?}");
                         let _ = reply.send(result);
                     }
+                    rtrace!("playback: waiting for the end or a request");
 
                     // Wait for the audio thread to exit, or for a request for other devices
                     loop {
                         parker.park();
+                        rtrace!(
+                            "playback: woke, stopped: {}",
+                            wake.stopped.load(Ordering::SeqCst)
+                        );
                         if wake.stopped.load(Ordering::SeqCst) {
                             break Outcome::Finished;
                         }
@@ -809,13 +873,17 @@ impl CpalMidir {
                         }
                     }
                 }
-                Err(err) => Outcome::OpenFailed(anyhow::anyhow!("{err:#}"), true),
+                Err(err) => {
+                    rtrace!("playback: opening failed: {err:#}");
+                    Outcome::OpenFailed(anyhow::anyhow!("{err:#}"), true)
+                }
             };
 
             // Nothing waits on another callback from here on: dropping a stream waits for its
             // callback to return, and a capture callback may be waiting for room that the output
             // callback (dropped first, or never started) no longer makes
             closing.store(true, Ordering::SeqCst);
+            rtrace!("closing set, MIDI teardown");
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -842,8 +910,12 @@ impl CpalMidir {
                     }
                 });
 
-            // The streams are closed as the scope ends
+            // The streams are closed
+            rtrace!("MIDI done, dropping the playback stream");
             drop(output_stream);
+            rtrace!("playback stream dropped, dropping the capture stream");
+            drop(_input_stream.take());
+            rtrace!("capture stream dropped");
             outcome
         })
     }
@@ -1008,7 +1080,12 @@ impl CpalMidir {
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
         let one_callback_thread = self.one_callback_thread;
+        let mut first_block = true;
         move |data, _info| {
+            if first_block {
+                first_block = false;
+                rtrace!("capture callback: first block, {} samples", data.len());
+            }
             for frame in data.chunks_exact(stream_channels) {
                 for sample in &frame[first..first + width] {
                     // If for whatever reason the input callback is fired twice before an output
@@ -1136,7 +1213,17 @@ impl CpalMidir {
         // Can't borrow from `self` in the callback
         let config = self.config.clone();
         let mut num_processed_samples = 0usize;
+        let mut first_block = true;
+        let mut starved_traced = false;
         move |data, _info| {
+            if first_block {
+                first_block = false;
+                rtrace!(
+                    "playback callback: first block, {} samples, capture ring has {:?}",
+                    data.len(),
+                    input_rb_consumer.as_ref().map(|rb| rb.slots())
+                );
+            }
             // A shared-mode driver (WASAPI) may hand out more frames than the `buffer_size` we
             // asked for, and the count may change between calls. The callback is therefore
             // processed in chunks of at most `buffer_size` frames.
@@ -1164,12 +1251,18 @@ impl CpalMidir {
                 match &mut input_rb_consumer {
                     Some(input_rb_consumer) => {
                         let frames = chunk_len;
+                        // Never waits long for capture: a stream's own thread answers play() and
+                        // drop only when this callback returns
+                        let mut starved = false;
                         for frame in 0..frames {
                             for channel in main_io_storage.iter_mut().take(num_input_channels) {
-                                // Waits if the output callback somehow outpaces the input callback,
-                                // until the streams are closing
-                                channel[frame] = pop_sample(input_rb_consumer, &unparker.closing);
+                                channel[frame] =
+                                    pop_sample(input_rb_consumer, &unparker.closing, &mut starved);
                             }
+                        }
+                        if starved && !starved_traced {
+                            starved_traced = true;
+                            rtrace!("playback callback: capture had no data in time (silence)");
                         }
                     }
                     None => {
@@ -1333,14 +1426,28 @@ fn push_sample(
     true
 }
 
-/// The next captured sample for the output callback, waiting for the capture callback if it has
-/// not delivered it yet. The wait ends when the streams are closing: silence then
-fn pop_sample(consumer: &mut rtrb::Consumer<f32>, closing: &AtomicBool) -> f32 {
+/// How long the output callback waits for one captured sample at most, once per block
+const SAMPLE_WAIT: std::time::Duration = std::time::Duration::from_micros(500);
+
+/// The next captured sample for the output callback. If capture has not delivered it yet the
+/// callback waits for it a short while (the capture callback is usually just behind), and then
+/// plays silence for the rest of the block (`starved`): a stream's own thread answers `play()` and
+/// the drop of the stream only when the callback returns, so it must never wait for capture for
+/// long. Silence at once when the streams are closing.
+fn pop_sample(consumer: &mut rtrb::Consumer<f32>, closing: &AtomicBool, starved: &mut bool) -> f32 {
+    if let Ok(sample) = consumer.pop() {
+        return sample;
+    }
+    if *starved || closing.load(Ordering::Relaxed) {
+        return 0.0;
+    }
+    let start = std::time::Instant::now();
     loop {
         if let Ok(sample) = consumer.pop() {
             return sample;
         }
-        if closing.load(Ordering::Relaxed) {
+        if closing.load(Ordering::Relaxed) || start.elapsed() >= SAMPLE_WAIT {
+            *starved = true;
             return 0.0;
         }
         std::hint::spin_loop();
@@ -1423,26 +1530,50 @@ mod push_tests {
         waiting.join().unwrap();
     }
 
-    /// The output callback waiting for a captured sample that does not come returns silence once
-    /// the streams are closing
+    /// The output callback never waits long for a captured sample: a stream's own thread answers
+    /// `play()` and the drop only when the callback returns
     #[test]
-    fn an_output_callback_waiting_on_an_empty_buffer_returns_silence_when_closing() {
+    fn an_output_callback_waiting_on_an_empty_buffer_plays_silence_soon() {
         let (mut producer, mut consumer) = RingBuffer::new(2);
-        let closing = Arc::new(AtomicBool::new(false));
+        let closing = AtomicBool::new(false);
+        let mut starved = false;
         producer.push(0.5).unwrap();
-        assert_eq!(super::pop_sample(&mut consumer, &closing), 0.5);
+        assert_eq!(
+            super::pop_sample(&mut consumer, &closing, &mut starved),
+            0.5
+        );
+        assert!(!starved);
 
-        let (done, finished) = std::sync::mpsc::channel();
-        let waiting = {
-            let closing = closing.clone();
-            std::thread::spawn(move || {
-                let _ = done.send(super::pop_sample(&mut consumer, &closing));
-            })
-        };
-        assert!(finished.recv_timeout(Duration::from_millis(100)).is_err());
-        closing.store(true, Ordering::SeqCst);
-        assert_eq!(finished.recv_timeout(Duration::from_secs(5)), Ok(0.0));
-        waiting.join().unwrap();
+        // Empty: silence after a short wait, and then no more waiting in this block
+        let start = std::time::Instant::now();
+        assert_eq!(
+            super::pop_sample(&mut consumer, &closing, &mut starved),
+            0.0
+        );
+        assert!(starved && start.elapsed() < Duration::from_millis(200));
+        let start = std::time::Instant::now();
+        for _ in 0..1000 {
+            assert_eq!(
+                super::pop_sample(&mut consumer, &closing, &mut starved),
+                0.0
+            );
+        }
+        assert!(
+            start.elapsed() < Duration::from_millis(100),
+            "a starved block does not wait"
+        );
+        // Data that arrives is played again in the next block
+        producer.push(0.25).unwrap();
+        assert_eq!(super::pop_sample(&mut consumer, &closing, &mut false), 0.25);
+    }
+
+    #[test]
+    fn an_output_callback_returns_silence_at_once_when_closing() {
+        let (_producer, mut consumer) = RingBuffer::new(2);
+        let closing = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        assert_eq!(super::pop_sample(&mut consumer, &closing, &mut false), 0.0);
+        assert!(start.elapsed() < Duration::from_millis(50));
     }
 
     #[test]

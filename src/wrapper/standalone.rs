@@ -32,6 +32,44 @@ pub fn nih_standalone_test_tone() -> bool {
     TEST_TONE.load(Ordering::Relaxed)
 }
 
+static TRACE_FILE: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+/// TEMPORARY, to find a hang on a change of devices: where [`trace`] writes besides stderr
+pub fn nih_standalone_set_trace_file(path: std::path::PathBuf) {
+    *TRACE_FILE.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+}
+
+/// TEMPORARY, to find a hang on a change of devices: a timestamped line on stderr and appended to
+/// the trace file (`nih_standalone_set_trace_file()`, else `nih-reconfigure-trace.log` in the
+/// temporary folder). Always on for now.
+pub fn trace(args: std::fmt::Arguments) {
+    use std::io::Write;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let thread = std::thread::current();
+    let line = format!(
+        "{}.{:03} [{}] fork: {}\n",
+        now.as_secs(),
+        now.subsec_millis(),
+        thread.name().unwrap_or("unnamed"),
+        args
+    );
+    eprint!("{line}");
+    let path = TRACE_FILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("nih-reconfigure-trace.log"));
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
 /// What [`nih_standalone_reconfigure()`] changes: the audio devices and the channels of them the
 /// plugin reads and writes. The driver, the sample rate and the period size stay as they are.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -69,22 +107,34 @@ static RECONFIGURE_WAKER: Mutex<Option<crossbeam::sync::Unparker>> = Mutex::new(
 pub fn nih_standalone_reconfigure(
     devices: StandaloneDevices,
 ) -> Result<mpsc::Receiver<Result<(), String>>, String> {
+    trace(format_args!(
+        "nih_standalone_reconfigure called: {devices:?}"
+    ));
     let waker = RECONFIGURE_WAKER.lock().unwrap_or_else(|e| e.into_inner());
     let Some(waker) = waker.as_ref() else {
+        trace(format_args!(
+            "no waker: the running backend takes no requests"
+        ));
         return Err("this audio driver cannot change devices while running".into());
     };
     let mut pending = RECONFIGURE.lock().unwrap_or_else(|e| e.into_inner());
     if pending.is_some() {
+        trace(format_args!("a request is already waiting"));
         return Err("the audio devices are already being changed".into());
     }
     let (reply, receiver) = mpsc::channel();
     *pending = Some(ReconfigureRequest { devices, reply });
     waker.unpark();
+    trace(format_args!("request stored, waker fired"));
     Ok(receiver)
 }
 
 /// The backend says it takes requests while `waker` is `Some`
 pub(crate) fn set_reconfigure_waker(waker: Option<crossbeam::sync::Unparker>) {
+    trace(format_args!(
+        "backend waker {}",
+        if waker.is_some() { "set" } else { "cleared" }
+    ));
     *RECONFIGURE_WAKER.lock().unwrap_or_else(|e| e.into_inner()) = waker;
     if waker_is_none() {
         // A request nobody will take is answered, not left hanging
@@ -105,7 +155,11 @@ fn waker_is_none() -> bool {
 
 /// The request waiting for the backend, if any
 pub(crate) fn take_reconfigure_request() -> Option<ReconfigureRequest> {
-    RECONFIGURE.lock().unwrap_or_else(|e| e.into_inner()).take()
+    let request = RECONFIGURE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if request.is_some() {
+        trace(format_args!("backend took the request"));
+    }
+    request
 }
 
 /// Open an NIH-plug plugin as a standalone application. If the plugin has an editor, this will open
