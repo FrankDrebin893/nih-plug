@@ -25,15 +25,6 @@ use crate::prelude::{
 };
 use crate::wrapper::util::buffer_management::{BufferManager, ChannelPointers};
 
-/// TEMPORARY, to find a hang on a change of devices: a timestamped trace line (stderr and file)
-macro_rules! rtrace {
-    ($($t:tt)*) => { super::super::trace(format_args!($($t)*)) };
-}
-
-fn device_name(device: &Device) -> String {
-    device.name().unwrap_or_else(|_| "?".into())
-}
-
 const MIDI_EVENT_QUEUE_CAPACITY: usize = 2048;
 
 /// An ASIO stream takes over every channel it opens, so it opens only the ones the plugin uses
@@ -348,12 +339,6 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         // the same callback. Only an output callback calls it, and only one set of streams
         // exists at a time, so the lock is never contended
         let cb = Arc::new(Mutex::new(cb));
-        rtrace!(
-            "run: start, host {:?}, input {:?}, output {}",
-            self.host_id,
-            self.input.as_ref().map(|d| device_name(&d.device)),
-            device_name(&self.output.device)
-        );
         let parker = Parker::new();
         super::super::set_reconfigure_waker(Some(parker.unparker().clone()));
 
@@ -361,17 +346,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         let mut retries = 0;
         let mut opened_once = false;
         loop {
-            rtrace!(
-                "run: opening streams (opened before: {opened_once}, change in progress: {})",
-                trying.is_some()
-            );
             match self.run_once::<P, _>(&cb, &parker, &mut trying) {
                 Outcome::Finished => {
-                    rtrace!("run: the streams finished");
                     break;
                 }
                 Outcome::Reconfigure(request) => {
-                    rtrace!("run: streams closed for a request: {:?}", request.devices);
                     opened_once = true;
                     retries = 0;
                     let mut config = self.config.clone();
@@ -379,14 +358,8 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     config.output_device = request.devices.output_device.clone();
                     config.input_channel = request.devices.input_channel.max(1);
                     config.output_channel = request.devices.output_channel.max(1);
-                    rtrace!("run: resolving the new devices");
                     match open_devices(&mut config, &self.audio_io_layout, self.host_id) {
                         Ok((input, output)) => {
-                            rtrace!(
-                                "run: devices resolved, input {:?}, output {}",
-                                input.as_ref().map(|d| device_name(&d.device)),
-                                device_name(&output.device)
-                            );
                             let saved = Saved {
                                 config: std::mem::replace(&mut self.config, config),
                                 input: std::mem::replace(&mut self.input, input),
@@ -400,15 +373,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                         }
                         // The old devices have been let go, so they are opened again
                         Err(err) => {
-                            rtrace!("run: the new devices could not be resolved: {err:#}");
                             let _ = request.reply.send(Err(format!("{err:#}")));
                         }
                     }
                 }
                 Outcome::OpenFailed(err, worth_retrying) => {
-                    rtrace!(
-                        "run: open failed ({err:#}), worth retrying {worth_retrying}, retry {retries}"
-                    );
                     if !opened_once {
                         super::super::set_reconfigure_waker(None);
                         panic!("Fatal error opening the audio streams: {err:#}");
@@ -429,7 +398,6 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             saved: Some(saved),
                             ..
                         }) => {
-                            rtrace!("run: the new devices failed, the old ones are opened again");
                             self.config = saved.config;
                             self.input = saved.input;
                             self.output = saved.output;
@@ -446,7 +414,6 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             saved: None,
                             result,
                         }) => {
-                            rtrace!("run: the old devices failed too");
                             let first = result.err().unwrap_or_default();
                             let _ = reply.send(Err(format!(
                                 "{first}; the old devices would not open again either: {err:#}"
@@ -458,7 +425,6 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                 }
             }
         }
-        rtrace!("run: end");
         super::super::set_reconfigure_waker(None);
     }
 }
@@ -610,12 +576,6 @@ impl CpalMidir {
                         }
                     }
                 }
-                rtrace!(
-                    "capture: building a stream on {} ({:?}, {:?})",
-                    device_name(&input.device),
-                    input.config,
-                    input.sample_format
-                );
                 let stream = build_input_streams!(
                     input.sample_format,
                     (SampleFormat::I8, i8),
@@ -631,9 +591,7 @@ impl CpalMidir {
                 )
                 .map_err(anyhow::Error::from)
                 .and_then(|stream| {
-                    rtrace!("capture: stream built, play() called");
                     stream.play().map_err(anyhow::Error::from)?;
-                    rtrace!("capture: play() returned");
                     Ok(stream)
                 });
                 let stream = match stream {
@@ -647,13 +605,8 @@ impl CpalMidir {
                 // Playback is delayed one period if we're capturing audio so it has something to
                 // process. When the devices are being changed a capture device that delivers
                 // nothing is an error to answer, not a wait for ever
-                rtrace!("capture: waiting for the first block");
                 if trying.is_some() {
                     input_parker.park_timeout(CAPTURE_START_TIMEOUT);
-                    rtrace!(
-                        "capture: wait over, ring empty: {}",
-                        input_rb_consumer.as_ref().is_some_and(|rb| rb.is_empty())
-                    );
                     if input_rb_consumer.as_ref().is_some_and(|rb| rb.is_empty()) {
                         return Outcome::OpenFailed(
                             anyhow::anyhow!("The capture device delivered no audio"),
@@ -662,7 +615,6 @@ impl CpalMidir {
                     }
                 } else {
                     input_parker.park();
-                    rtrace!("capture: the first block came");
                 }
             }
 
@@ -816,12 +768,6 @@ impl CpalMidir {
                     }
                 }
             }
-            rtrace!(
-                "playback: building a stream on {} ({:?}, {:?})",
-                device_name(&self.output.device),
-                self.output.config,
-                self.output.sample_format
-            );
             let output_stream = build_output_streams!(
                 self.output.sample_format,
                 (SampleFormat::I8, i8),
@@ -838,9 +784,7 @@ impl CpalMidir {
             .map_err(anyhow::Error::from)
             .and_then(|stream| {
                 // TODO: Wait a period before doing this when also reading the input
-                rtrace!("playback: stream built, play() called");
                 stream.play().map_err(anyhow::Error::from)?;
-                rtrace!("playback: play() returned");
                 Ok(stream)
             });
 
@@ -848,18 +792,12 @@ impl CpalMidir {
                 Ok(_) => {
                     // The change that was asked for is in place
                     if let Some(Trying { reply, result, .. }) = trying.take() {
-                        rtrace!("playback: answer sent: {result:?}");
                         let _ = reply.send(result);
                     }
-                    rtrace!("playback: waiting for the end or a request");
 
                     // Wait for the audio thread to exit, or for a request for other devices
                     loop {
                         parker.park();
-                        rtrace!(
-                            "playback: woke, stopped: {}",
-                            wake.stopped.load(Ordering::SeqCst)
-                        );
                         if wake.stopped.load(Ordering::SeqCst) {
                             break Outcome::Finished;
                         }
@@ -868,17 +806,13 @@ impl CpalMidir {
                         }
                     }
                 }
-                Err(err) => {
-                    rtrace!("playback: opening failed: {err:#}");
-                    Outcome::OpenFailed(anyhow::anyhow!("{err:#}"), true)
-                }
+                Err(err) => Outcome::OpenFailed(anyhow::anyhow!("{err:#}"), true),
             };
 
             // Nothing waits on another callback from here on: dropping a stream waits for its
             // callback to return, and a capture callback may be waiting for room that the output
             // callback (dropped first, or never started) no longer makes
             closing.store(true, Ordering::SeqCst);
-            rtrace!("closing set, MIDI teardown");
 
             // The Midir API requires us to take things out of Options and transform between these
             // structs
@@ -906,11 +840,8 @@ impl CpalMidir {
                 });
 
             // The streams are closed
-            rtrace!("MIDI done, dropping the playback stream");
             drop(output_stream);
-            rtrace!("playback stream dropped, dropping the capture stream");
             drop(_input_stream.take());
-            rtrace!("capture stream dropped");
             outcome
         })
     }
@@ -1065,28 +996,15 @@ impl CpalMidir {
             .main_input_channels
             .map(NonZeroU32::get)
             .unwrap_or(0) as usize;
-        let mut first_block = true;
-        let mut dropped = 0usize;
-        let mut dropped_traced = false;
         move |data, _info| {
-            if first_block {
-                first_block = false;
-                rtrace!("capture callback: first block, {} samples", data.len());
-            }
             // The callback never waits for room: WASAPI's shared mode ignores the buffer size and
             // may deliver far more than a period at once, and a callback that waited for the
             // output (not yet built, as it starts after this one returns) never returned. What
-            // does not fit is dropped and counted
+            // does not fit is dropped
             for frame in data.chunks_exact(stream_channels) {
                 for sample in &frame[first..first + width] {
-                    if !push_sample(&mut input_rb_producer, sample.to_sample()) {
-                        dropped += 1;
-                    }
+                    push_sample(&mut input_rb_producer, sample.to_sample());
                 }
-            }
-            if dropped > 0 && !dropped_traced {
-                dropped_traced = true;
-                rtrace!("capture callback: the ring was full, {dropped} samples dropped so far");
             }
 
             // The run function is blocked until a single period has been processed here. After this
@@ -1200,17 +1118,7 @@ impl CpalMidir {
         // Can't borrow from `self` in the callback
         let config = self.config.clone();
         let mut num_processed_samples = 0usize;
-        let mut first_block = true;
-        let mut starved_traced = false;
         move |data, _info| {
-            if first_block {
-                first_block = false;
-                rtrace!(
-                    "playback callback: first block, {} samples, capture ring has {:?}",
-                    data.len(),
-                    input_rb_consumer.as_ref().map(|rb| rb.slots())
-                );
-            }
             // A shared-mode driver (WASAPI) may hand out more frames than the `buffer_size` we
             // asked for, and the count may change between calls. The callback is therefore
             // processed in chunks of at most `buffer_size` frames.
@@ -1246,10 +1154,6 @@ impl CpalMidir {
                                 channel[frame] =
                                     pop_sample(input_rb_consumer, &unparker.closing, &mut starved);
                             }
-                        }
-                        if starved && !starved_traced {
-                            starved_traced = true;
-                            rtrace!("playback callback: capture had no data in time (silence)");
                         }
                     }
                     None => {
