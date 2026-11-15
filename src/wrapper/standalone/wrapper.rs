@@ -175,7 +175,10 @@ impl<P: Plugin, B: Backend<P>> MainThreadExecutor<Task<P>> for Wrapper<P, B> {
 impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
     /// Instantiate a new instance of the standalone wrapper. Returns an error if the plugin does
     /// not accept the IO configuration from the wrapper config.
-    pub fn new(backend: B, config: WrapperConfig) -> Result<Arc<Self>, WrapperError> {
+    pub fn new(backend: B, mut config: WrapperConfig) -> Result<Arc<Self>, WrapperError> {
+        // A backend that opened devices knows the sample rate and the period size they run at,
+        // and the plugin has to be told those and not what was asked for
+        backend.resolve_config(&mut config);
         // The backend has already queried this, so this will never cause the program to exit
         // TODO: Do the validation and parsing in the argument parser so this value can be stored on
         //       the config itself. Right now clap doesn't support this.
@@ -241,7 +244,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
 
             audio_io_layout,
             buffer_config: BufferConfig {
-                sample_rate: config.sample_rate,
+                sample_rate: config.sample_rate_or_default(),
                 min_buffer_size: None,
                 max_buffer_size: config.period_size,
                 // TODO: Detect JACK freewheeling and report it here

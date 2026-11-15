@@ -30,8 +30,9 @@ impl<P: Plugin> Backend<P> for Dummy {
     ) {
         // We can't really do anything meaningful here, so we'll simply periodically call the
         // callback with empty buffers
-        let interval =
-            Duration::from_secs_f32(self.config.period_size as f32 / self.config.sample_rate);
+        let interval = Duration::from_secs_f32(
+            self.config.period_size as f32 / self.config.sample_rate_or_default(),
+        );
 
         let num_samples = self.config.period_size as usize;
         let num_output_channels = self
@@ -106,7 +107,7 @@ impl<P: Plugin> Backend<P> for Dummy {
             }
             let period_start = Instant::now();
 
-            let mut transport = Transport::new(self.config.sample_rate);
+            let mut transport = Transport::new(self.config.sample_rate_or_default());
             transport.pos_samples = Some(num_processed_samples as i64);
             transport.tempo = Some(self.config.tempo as f64);
             transport.time_sig_numerator = Some(self.config.timesig_num as i32);

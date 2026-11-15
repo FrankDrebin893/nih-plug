@@ -432,3 +432,116 @@ mod reconfigure_tests {
         drop(host);
     }
 }
+
+#[cfg(test)]
+mod sample_rate_tests {
+    use super::*;
+    use crate::prelude::*;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    static SEEN: Mutex<Option<(f32, u32)>> = Mutex::new(None);
+
+    struct NoParams;
+
+    // SAFETY: no parameters, so no pointers
+    unsafe impl Params for NoParams {
+        fn param_map(&self) -> Vec<(String, ParamPtr, String)> {
+            Vec::new()
+        }
+    }
+
+    /// Writes down the buffer configuration it is initialized with
+    #[derive(Default)]
+    struct Recorder;
+
+    impl Plugin for Recorder {
+        const NAME: &'static str = "Recorder";
+        const VENDOR: &'static str = "Test";
+        const URL: &'static str = "";
+        const EMAIL: &'static str = "";
+        const VERSION: &'static str = "0";
+        const AUDIO_IO_LAYOUTS: &'static [AudioIOLayout] = &[AudioIOLayout {
+            main_input_channels: None,
+            main_output_channels: NonZeroU32::new(2),
+            ..AudioIOLayout::const_default()
+        }];
+        type SysExMessage = ();
+        type BackgroundTask = ();
+
+        fn params(&self) -> Arc<dyn Params> {
+            Arc::new(NoParams)
+        }
+
+        fn initialize(
+            &mut self,
+            _: &AudioIOLayout,
+            buffer_config: &BufferConfig,
+            _: &mut impl InitContext<Self>,
+        ) -> bool {
+            *SEEN.lock().unwrap() =
+                Some((buffer_config.sample_rate, buffer_config.max_buffer_size));
+            true
+        }
+
+        fn process(
+            &mut self,
+            _: &mut Buffer,
+            _: &mut AuxiliaryBuffers,
+            _: &mut impl ProcessContext<Self>,
+        ) -> ProcessStatus {
+            ProcessStatus::Normal
+        }
+    }
+
+    /// A backend that opened a device running at 44.1 kHz, whatever the configuration asked for
+    struct Device44100;
+
+    impl Backend<Recorder> for Device44100 {
+        fn resolve_config(&self, config: &mut WrapperConfig) {
+            config.sample_rate = Some(44100.0);
+            config.period_size = 256;
+        }
+
+        fn run(
+            &mut self,
+            _: impl FnMut(
+                    &mut Buffer,
+                    &mut AuxiliaryBuffers,
+                    Transport,
+                    &[PluginNoteEvent<Recorder>],
+                    &mut Vec<PluginNoteEvent<Recorder>>,
+                ) -> bool
+                + 'static
+                + Send,
+        ) {
+        }
+    }
+
+    fn config(args: &[&str]) -> WrapperConfig {
+        WrapperConfig::from_arg_matches(
+            &WrapperConfig::command()
+                .get_matches_from(std::iter::once("x").chain(args.iter().copied())),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn no_sample_rate_asked_for_is_none() {
+        assert_eq!(config(&[]).sample_rate, None);
+        assert_eq!(
+            config(&["--sample-rate", "96000"]).sample_rate,
+            Some(96000.0)
+        );
+    }
+
+    /// The plugin is told the rate the stream runs at, not the one the configuration had before the
+    /// devices were opened
+    #[test]
+    fn the_plugin_gets_the_rate_the_backend_resolved() {
+        let _wrapper = Wrapper::<Recorder, _>::new(Device44100, config(&[]))
+            .ok()
+            .unwrap();
+        assert_eq!(*SEEN.lock().unwrap(), Some((44100.0, 256)));
+    }
+}

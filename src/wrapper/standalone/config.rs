@@ -21,11 +21,13 @@ pub struct WrapperConfig {
     //       is invalid
     #[clap(value_parser, short = 'l', long)]
     pub audio_layout: Option<String>,
-    /// The audio backend's sample rate.
+    /// The audio backend's sample rate. Defaults to the sample rate the output device runs at
+    /// (48000 Hz with the dummy backend). A device that does not take the rate asked for fails to
+    /// open.
     ///
     /// This setting is ignored when using the JACK backend.
-    #[clap(value_parser, short = 'r', long, default_value = "48000")]
-    pub sample_rate: f32,
+    #[clap(value_parser, short = 'r', long)]
+    pub sample_rate: Option<f32>,
     /// The audio backend's period size.
     ///
     /// This setting is ignored when using the JACK backend.
@@ -131,7 +133,16 @@ pub enum BackendType {
     Dummy,
 }
 
+/// The sample rate of a backend that has no device to take one from (the dummy backend, JACK).
+pub const DEFAULT_SAMPLE_RATE: f32 = 48000.0;
+
 impl WrapperConfig {
+    /// The sample rate this configuration asks for, or [`DEFAULT_SAMPLE_RATE`] where a backend has
+    /// not resolved it from its device.
+    pub fn sample_rate_or_default(&self) -> f32 {
+        self.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE)
+    }
+
     /// Get the audio IO layout for a plugin based on this configuration. Exits the application if
     /// the IO layout could not be parsed from the config. This doesn't return a `Result` to be able to differentiate between backend-specific errors and config parsing errors.
     pub fn audio_io_layout_or_exit<P: Plugin>(&self) -> AudioIOLayout {

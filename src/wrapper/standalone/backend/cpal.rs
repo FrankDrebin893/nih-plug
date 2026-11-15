@@ -112,26 +112,48 @@ fn open_devices(
     // The channels are counted from 1 on the command line, from 0 here
     let input_first_channel = config.input_channel.saturating_sub(1) as usize;
     let output_first_channel = config.output_channel.saturating_sub(1) as usize;
-    let requested_sample_rate = cpal::SampleRate(config.sample_rate as u32);
+    // The device's own sample rate unless one was asked for: a shared-mode WASAPI stream opens
+    // only at the rate the device is set to mix at, so a fixed default fails on a 44.1 kHz one
+    let output_name = output_device.name().unwrap_or_default();
+    let device_default_rate = output_device
+        .default_output_config()
+        .ok()
+        .map(|c| c.sample_rate().0);
+    let requested_sample_rate = cpal::SampleRate(resolve_sample_rate(
+        config.sample_rate,
+        device_default_rate,
+        &output_name,
+    )?);
+    // Recorded, so the wrapper tells the plugin the rate the stream really runs at
+    config.sample_rate = Some(requested_sample_rate.0 as f32);
     // An ASIO driver has the buffer size it was set to in its own control panel (a Focusrite
     // reports 64 as both its smallest and its largest while it is set to 64), so the size
-    // asked for is brought into the driver's range instead of failing to start
-    #[cfg(feature = "asio")]
-    if cpal_host_id == cpal::HostId::Asio {
-        if let Some(cpal::SupportedBufferSize::Range { min, max }) = output_device
-            .supported_output_configs()
-            .ok()
-            .and_then(|mut configs| configs.next())
-            .map(|c| *c.buffer_size())
-        {
-            let size = config.period_size.clamp(min, max);
-            if size != config.period_size {
-                nih_log!(
-                        "The ASIO driver takes buffers of {min} to {max} samples: using {size}                          instead of {}",
-                        config.period_size
-                    );
-                config.period_size = size;
+    // asked for is brought into the driver's range instead of failing to start. The default
+    // configuration of a device gives a range and not a size, so this holds for every driver
+    if let Some(cpal::SupportedBufferSize::Range { min, max }) = output_device
+        .supported_output_configs()
+        .ok()
+        .and_then(|configs| {
+            let mut configs: Vec<_> = configs.collect();
+            let at_rate = configs.iter().position(|c| {
+                (c.min_sample_rate()..=c.max_sample_rate()).contains(&requested_sample_rate)
+            });
+            if configs.is_empty() {
+                None
+            } else {
+                Some(configs.swap_remove(at_rate.unwrap_or(0)))
             }
+        })
+        .map(|c| *c.buffer_size())
+    {
+        let size = clamp_period_size(config.period_size, min, max);
+        if size != config.period_size {
+            nih_log!(
+                "The audio device takes buffers of {min} to {max} samples: using {size} instead \
+                 of {}",
+                config.period_size
+            );
+            config.period_size = size;
         }
     }
     let requested_buffer_size = cpal::BufferSize::Fixed(config.period_size);
@@ -168,10 +190,12 @@ fn open_devices(
                 .with_context(|| {
                     format!(
                         "The audio input device does not have {} audio channels from \
-                             channel {} at a sample rate of {} Hz and a period size of {} samples",
+                             channel {} at a sample rate of {} Hz (the rate of the output device \
+                             '{}') and a period size of {} samples",
                         num_input_channels,
                         config.input_channel,
-                        config.sample_rate,
+                        requested_sample_rate.0,
+                        output_name,
                         config.period_size,
                     )
                 })?;
@@ -226,11 +250,17 @@ fn open_devices(
             .with_context(|| {
                 format!(
                     "The audio output device does not have {} audio channels from channel {} \
-                         at a sample rate of {} Hz and a period size of {} samples",
+                         at a sample rate of {} Hz and a period size of {} samples{}",
                     num_output_channels,
                     config.output_channel,
-                    config.sample_rate,
+                    requested_sample_rate.0,
                     config.period_size,
+                    match device_default_rate {
+                        Some(rate) if rate != requested_sample_rate.0 => {
+                            format!(" (the device '{output_name}' runs at {rate} Hz)")
+                        }
+                        _ => String::new(),
+                    },
                 )
             })?;
         let output_config = StreamConfig {
@@ -252,6 +282,28 @@ fn open_devices(
     };
 
     Ok((input, output))
+}
+
+/// The sample rate a stream is opened at: the one asked for, or else the one the output device
+/// runs at. A device that reports none and is given none is an error that names it
+fn resolve_sample_rate(
+    requested: Option<f32>,
+    device_default: Option<u32>,
+    device_name: &str,
+) -> Result<u32> {
+    match (requested, device_default) {
+        (Some(rate), _) => Ok(rate as u32),
+        (None, Some(rate)) => Ok(rate),
+        (None, None) => anyhow::bail!(
+            "The audio output device '{device_name}' does not report a sample rate, use \
+             '--sample-rate' to choose one"
+        ),
+    }
+}
+
+/// The period size brought into the range a device takes
+fn clamp_period_size(size: u32, min: u32, max: u32) -> u32 {
+    size.clamp(min, max.max(min))
 }
 
 /// Uses CPAL for audio and midir for MIDI.
@@ -322,6 +374,11 @@ enum MidiOutputTask<P: Plugin> {
 }
 
 impl<P: Plugin> Backend<P> for CpalMidir {
+    fn resolve_config(&self, config: &mut WrapperConfig) {
+        config.sample_rate = self.config.sample_rate;
+        config.period_size = self.config.period_size;
+    }
+
     fn run(
         &mut self,
         cb: impl FnMut(
@@ -1128,7 +1185,7 @@ impl CpalMidir {
                 let data = &mut data
                     [frame_offset * device_channels..(frame_offset + chunk_len) * device_channels];
                 frame_offset += chunk_len;
-                let mut transport = Transport::new(config.sample_rate);
+                let mut transport = Transport::new(config.sample_rate_or_default());
                 transport.pos_samples = Some(num_processed_samples as i64);
                 transport.tempo = Some(config.tempo as f64);
                 transport.time_sig_numerator = Some(config.timesig_num as i32);
@@ -1358,6 +1415,50 @@ fn chunk_lengths(frames: usize, max: usize) -> impl Iterator<Item = usize> {
             Some(n)
         }
     })
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::{clamp_period_size, resolve_sample_rate};
+
+    #[test]
+    fn an_explicit_rate_wins_over_the_devices() {
+        assert_eq!(
+            resolve_sample_rate(Some(96000.0), Some(44100), "Out").unwrap(),
+            96000
+        );
+        assert_eq!(
+            resolve_sample_rate(Some(44100.0), None, "Out").unwrap(),
+            44100
+        );
+    }
+
+    #[test]
+    fn no_rate_takes_the_devices_own() {
+        assert_eq!(
+            resolve_sample_rate(None, Some(44100), "Out").unwrap(),
+            44100
+        );
+        assert_eq!(
+            resolve_sample_rate(None, Some(48000), "Out").unwrap(),
+            48000
+        );
+    }
+
+    #[test]
+    fn a_device_without_a_rate_is_reported_by_name() {
+        let err = resolve_sample_rate(None, None, "Focusrite").unwrap_err();
+        assert!(format!("{err:#}").contains("'Focusrite'"));
+    }
+
+    #[test]
+    fn the_period_size_is_brought_into_the_devices_range() {
+        assert_eq!(clamp_period_size(512, 64, 64), 64);
+        assert_eq!(clamp_period_size(512, 32, 4096), 512);
+        assert_eq!(clamp_period_size(16, 32, 4096), 32);
+        // A range that reports nothing useful leaves the size alone
+        assert_eq!(clamp_period_size(512, 0, u32::MAX), 512);
+    }
 }
 
 #[cfg(test)]
