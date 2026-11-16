@@ -16,6 +16,8 @@ use std::sync::Mutex;
 mod backend;
 mod config;
 mod context;
+#[cfg(test)]
+mod tests;
 mod wrapper;
 
 static TEST_TONE: AtomicBool = AtomicBool::new(false);
@@ -32,9 +34,9 @@ pub fn nih_standalone_test_tone() -> bool {
     TEST_TONE.load(Ordering::Relaxed)
 }
 
-/// What [`nih_standalone_reconfigure()`] changes: the audio devices and the channels of them the
-/// plugin reads and writes. The driver, the sample rate and the period size stay as they are.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// What [`nih_standalone_reconfigure()`] changes: the audio devices, the channels of them the
+/// plugin reads and writes, the sample rate and the period size. The driver stays as it is.
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct StandaloneDevices {
     /// The input device by name. `None` connects no input.
     pub input_device: Option<String>,
@@ -44,6 +46,10 @@ pub struct StandaloneDevices {
     pub input_channel: u32,
     /// The first channel (counted from 1) of the output device the plugin writes. 0 counts as 1.
     pub output_channel: u32,
+    /// The sample rate in Hz. `None` is the output device's own, as without `--sample-rate`.
+    pub sample_rate: Option<f32>,
+    /// The period size in samples. `None` is the default, as without `--period-size`.
+    pub period_size: Option<u32>,
 }
 
 /// A change of devices that waits for the running backend to take it.
@@ -57,8 +63,10 @@ static RECONFIGURE: Mutex<Option<ReconfigureRequest>> = Mutex::new(None);
 static RECONFIGURE_WAKER: Mutex<Option<crossbeam::sync::Unparker>> = Mutex::new(None);
 
 /// Asks the running standalone host to close its audio streams and open them again on other
-/// devices or channels, while the plugin keeps running (the same instance: no `initialize`, no
-/// state lost, the process callback only misses the blocks of the gap). Returns at once.
+/// devices, channels, sample rate or period size, while the plugin keeps running (the same
+/// instance, no state lost, the process callback only misses the blocks of the gap). Returns at
+/// once. The plugin is initialised again, in the gap and with the new `BufferConfig`, only when the
+/// sample rate or the period size the streams open at is not the one that played before.
 ///
 /// - `Err` at once: this backend cannot do it (JACK, or no backend running, or another request is
 ///   still being taken). The caller keeps the old devices and may start the program again
@@ -306,6 +314,10 @@ fn print_error(error: WrapperError) {
     }
 }
 
+/// The request slot and the running backend are process-wide, so the tests that use them take turns
+#[cfg(test)]
+static TEST_TURN: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod reconfigure_tests {
     use super::*;
@@ -385,6 +397,7 @@ mod reconfigure_tests {
     /// One test, since the host and the request slot are process-wide
     #[test]
     fn reconfigure_keeps_the_plugin_running_and_initialised_once() {
+        let _turn = TEST_TURN.lock().unwrap_or_else(|e| e.into_inner());
         let host = std::thread::spawn(|| {
             nih_export_standalone_with_args::<Counter, _>(
                 ["counter", "--backend", "dummy", "-p", "64"].map(String::from),
@@ -396,6 +409,8 @@ mod reconfigure_tests {
             output_device: Some("Dummy".into()),
             input_channel: 1,
             output_channel: 3,
+            // The period size the host was started with: a different one is a new initialize
+            period_size: Some(64),
             ..StandaloneDevices::default()
         };
         let answer = nih_standalone_reconfigure(devices).expect("the host takes requests");
@@ -413,6 +428,7 @@ mod reconfigure_tests {
         // A device that is not there is an error, and what played goes on playing
         let answer = nih_standalone_reconfigure(StandaloneDevices {
             output_device: Some("Missing".into()),
+            period_size: Some(64),
             ..StandaloneDevices::default()
         })
         .expect("the host takes requests");
@@ -514,6 +530,7 @@ mod sample_rate_tests {
                 ) -> bool
                 + 'static
                 + Send,
+            _: impl FnMut(f32, u32) -> bool + 'static + Send,
         ) {
         }
     }

@@ -31,7 +31,7 @@ pub struct WrapperConfig {
     /// The audio backend's period size.
     ///
     /// This setting is ignored when using the JACK backend.
-    #[clap(value_parser, short = 'p', long, default_value = "512")]
+    #[clap(value_parser, short = 'p', long, default_value = "512")] // DEFAULT_PERIOD_SIZE
     pub period_size: u32,
 
     /// The input device for the ALSA, CoreAudio, and WASAPI backends. No input will be connected if
@@ -132,6 +132,9 @@ pub enum BackendType {
     /// Does not playback or receive any audio or MIDI.
     Dummy,
 }
+
+/// The period size when none is asked for (`--period-size`)
+pub const DEFAULT_PERIOD_SIZE: u32 = 512;
 
 /// The sample rate of a backend that has no device to take one from (the dummy backend, JACK).
 pub const DEFAULT_SAMPLE_RATE: f32 = 48000.0;

@@ -64,6 +64,8 @@ impl<P: Plugin> Backend<P> for Jack {
             ) -> bool
             + 'static
             + Send,
+        // JACK's sample rate and buffer size are the server's, not ours to change
+        _reinit: impl FnMut(f32, u32) -> bool + 'static + Send,
     ) {
         let client = self.client.take().unwrap();
         let buffer_size = client.buffer_size();

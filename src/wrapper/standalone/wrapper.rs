@@ -66,7 +66,9 @@ pub struct Wrapper<P: Plugin, B: Backend<P>> {
 
     /// The bus and buffer configurations are static for the standalone target.
     audio_io_layout: AudioIOLayout,
-    buffer_config: BufferConfig,
+    /// The sample rate and period size the plugin runs at. They change only while the audio is
+    /// stopped, when a backend changes them (`reinitialize()`)
+    buffer_config: Mutex<BufferConfig>,
 
     /// Parameter changes that have been output by the GUI that have not yet been set in the plugin.
     /// This queue will be flushed at the end of every processing cycle, just like in the plugin
@@ -243,13 +245,13 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                 .collect(),
 
             audio_io_layout,
-            buffer_config: BufferConfig {
+            buffer_config: Mutex::new(BufferConfig {
                 sample_rate: config.sample_rate_or_default(),
                 min_buffer_size: None,
                 max_buffer_size: config.period_size,
                 // TODO: Detect JACK freewheeling and report it here
                 process_mode: ProcessMode::Realtime,
-            },
+            }),
             config,
 
             unprocessed_param_changes: ArrayQueue::new(EVENT_QUEUE_CAPACITY),
@@ -286,15 +288,16 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
             .map(|editor| Arc::new(Mutex::new(editor)));
 
         // Before initializing the plugin, make sure all smoothers are set the the default values
+        let buffer_config = *wrapper.buffer_config.lock();
         for param in wrapper.param_id_to_ptr.values() {
-            unsafe { param.update_smoother(wrapper.buffer_config.sample_rate, true) };
+            unsafe { param.update_smoother(buffer_config.sample_rate, true) };
         }
 
         {
             let mut plugin = wrapper.plugin.lock();
             if !plugin.initialize(
                 &wrapper.audio_io_layout,
-                &wrapper.buffer_config,
+                &buffer_config,
                 &mut wrapper.make_init_context(),
             ) {
                 return Err(WrapperError::InitializationFailed);
@@ -510,7 +513,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
     ) {
         // The phase of the test tone (`nih_standalone_set_test_tone()`), in cycles
         let mut tone_phase = 0.0f32;
-        let tone_step = 440.0 / self.buffer_config.sample_rate;
+        let reinit_wrapper = self.clone();
         self.clone().backend.borrow_mut().run(
             move |buffer, aux, transport, input_events, output_events| {
                 // TODO: This process wrapper should actually be in the backends (since the backends
@@ -521,7 +524,8 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                         return false;
                     }
 
-                    let sample_rate = self.buffer_config.sample_rate;
+                    let sample_rate = self.buffer_config.lock().sample_rate;
+                    let tone_step = 440.0 / sample_rate;
                     {
                         let mut plugin = self.plugin.lock();
                         if let ProcessStatus::Error(err) = plugin.process(
@@ -596,7 +600,50 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
                     true
                 })
             },
+            // The backend changed the sample rate or the period size while the audio is stopped
+            move |sample_rate, period_size| reinit_wrapper.reinitialize(sample_rate, period_size),
         );
+    }
+
+    /// Tells the plugin a new sample rate and period size: its parameter smoothers are set up for
+    /// the rate and it is initialised again, as a host does after a change of audio settings.
+    /// Called by a backend from its own thread, in the gap where the audio is stopped, never from
+    /// a process callback. Returns whether the plugin took the new settings; if it did not, the
+    /// old ones stand again, and the caller calls this again with them to initialise the plugin
+    /// with those.
+    pub fn reinitialize(&self, sample_rate: f32, period_size: u32) -> bool {
+        let old = *self.buffer_config.lock();
+        let new = BufferConfig {
+            sample_rate,
+            max_buffer_size: period_size,
+            ..old
+        };
+        *self.buffer_config.lock() = new;
+        for param in self.param_id_to_ptr.values() {
+            unsafe { param.update_smoother(sample_rate, true) };
+        }
+
+        let mut init_context = self.make_init_context();
+        let mut plugin = self.plugin.lock();
+        let success = plugin.initialize(&self.audio_io_layout, &new, &mut init_context);
+        if success {
+            process_wrapper(|| plugin.reset());
+        } else {
+            nih_error!(
+                "The plugin did not take {sample_rate} Hz and a period of {period_size} samples"
+            );
+            *self.buffer_config.lock() = old;
+            for param in self.param_id_to_ptr.values() {
+                unsafe { param.update_smoother(old.sample_rate, true) };
+            }
+        }
+        success
+    }
+
+    /// The sample rate and period size the plugin was last initialised with
+    #[cfg(test)]
+    pub fn buffer_config(&self) -> BufferConfig {
+        *self.buffer_config.lock()
     }
 
     fn make_gui_context(self: Arc<Self>) -> Arc<WrapperGuiContext<P, B>> {
@@ -644,12 +691,13 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
         //        supports runtime preset loading. `state::deserialize_object()` normally never
         //        allocates, but if the plugin has persistent non-parameter data then its
         //        `deserialize_fields()` implementation may still allocate.
+        let buffer_config = *self.buffer_config.lock();
         let mut success = permit_alloc(|| unsafe {
             state::deserialize_object::<P>(
                 state,
                 self.params.clone(),
                 |param_id| self.param_id_to_ptr.get(param_id).copied(),
-                Some(&self.buffer_config),
+                Some(&buffer_config),
             )
         });
         if !success {
@@ -665,11 +713,7 @@ impl<P: Plugin, B: Backend<P>> Wrapper<P, B> {
 
             // See above
             success = permit_alloc(|| {
-                plugin.initialize(
-                    &self.audio_io_layout,
-                    &self.buffer_config,
-                    &mut init_context,
-                )
+                plugin.initialize(&self.audio_io_layout, &buffer_config, &mut init_context)
             });
             if success {
                 process_wrapper(|| plugin.reset());

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::ScopedJoinHandle;
 
-use super::super::config::WrapperConfig;
+use super::super::config::{WrapperConfig, DEFAULT_PERIOD_SIZE};
 use super::Backend;
 use crate::midi::MidiResult;
 use crate::prelude::{
@@ -390,6 +390,7 @@ impl<P: Plugin> Backend<P> for CpalMidir {
             ) -> bool
             + 'static
             + Send,
+        mut reinit: impl FnMut(f32, u32) -> bool + 'static + Send,
     ) {
         // The process callback outlives one set of streams: a request to change the devices
         // (`nih_standalone_reconfigure()`) closes the streams, opens the new ones and gives them
@@ -415,8 +416,24 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                     config.output_device = request.devices.output_device.clone();
                     config.input_channel = request.devices.input_channel.max(1);
                     config.output_channel = request.devices.output_channel.max(1);
+                    // `None` is what no argument asks for: the output device's own rate, the
+                    // default period size
+                    config.sample_rate = request.devices.sample_rate;
+                    config.period_size = request.devices.period_size.unwrap_or(DEFAULT_PERIOD_SIZE);
                     match open_devices(&mut config, &self.audio_io_layout, self.host_id) {
                         Ok((input, output)) => {
+                            // Another sample rate or period size is a plugin that is
+                            // initialised again, now, while no stream plays
+                            let old = stream_settings(&self.config);
+                            let new = stream_settings(&config);
+                            if new != old && !reinit(new.0, new.1) {
+                                reinit(old.0, old.1);
+                                let _ = request.reply.send(Err(format!(
+                                    "The plugin did not take {} Hz with a period of {} samples",
+                                    new.0, new.1
+                                )));
+                                continue;
+                            }
                             let saved = Saved {
                                 config: std::mem::replace(&mut self.config, config),
                                 input: std::mem::replace(&mut self.input, input),
@@ -455,6 +472,13 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             saved: Some(saved),
                             ..
                         }) => {
+                            // The plugin goes back to the sample rate and period size of the
+                            // old devices before they play again
+                            let failed = stream_settings(&self.config);
+                            let old = stream_settings(&saved.config);
+                            if failed != old {
+                                reinit(old.0, old.1);
+                            }
                             self.config = saved.config;
                             self.input = saved.input;
                             self.output = saved.output;
@@ -484,6 +508,11 @@ impl<P: Plugin> Backend<P> for CpalMidir {
         }
         super::super::set_reconfigure_waker(None);
     }
+}
+
+/// The sample rate and period size a configuration's streams run at
+fn stream_settings(config: &WrapperConfig) -> (f32, u32) {
+    (config.sample_rate_or_default(), config.period_size)
 }
 
 /// How long a change of devices waits for the new capture device's first block
