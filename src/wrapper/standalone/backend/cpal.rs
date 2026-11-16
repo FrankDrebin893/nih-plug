@@ -428,10 +428,16 @@ impl<P: Plugin> Backend<P> for CpalMidir {
                             let new = stream_settings(&config);
                             if new != old && !reinit(new.0, new.1) {
                                 reinit(old.0, old.1);
-                                let _ = request.reply.send(Err(format!(
-                                    "The plugin did not take {} Hz with a period of {} samples",
-                                    new.0, new.1
-                                )));
+                                // The old devices are opened again, and the error is the
+                                // answer once they play, as when the new ones will not open
+                                trying = Some(Trying {
+                                    reply: request.reply,
+                                    saved: None,
+                                    result: Err(format!(
+                                        "The plugin did not take {} Hz with a period of {} samples",
+                                        new.0, new.1
+                                    )),
+                                });
                                 continue;
                             }
                             let saved = Saved {
