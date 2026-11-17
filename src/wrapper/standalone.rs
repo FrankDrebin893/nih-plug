@@ -34,6 +34,28 @@ pub fn nih_standalone_test_tone() -> bool {
     TEST_TONE.load(Ordering::Relaxed)
 }
 
+/// Which audio the standalone host is running on, for an editor to say so when there is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandaloneAudioStatus {
+    /// A real backend (`"JACK"`, `"ALSA"`, `"WASAPI"`, `"CoreAudio"`, `"ASIO"`) opened its devices.
+    Running { backend: &'static str },
+    /// The dummy backend: no audio and no MIDI. `reason` is the error the host logged when it fell
+    /// back to it, and `None` when the dummy backend was asked for with `--backend dummy`.
+    Dummy { reason: Option<String> },
+}
+
+static AUDIO_STATUS: Mutex<Option<StandaloneAudioStatus>> = Mutex::new(None);
+
+fn set_audio_status(status: StandaloneAudioStatus) {
+    *AUDIO_STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+}
+
+/// The audio the standalone host runs on, set once the backend is chosen and readable from any
+/// thread. `None` before that, and always `None` outside the standalone host (in a DAW).
+pub fn nih_standalone_audio_status() -> Option<StandaloneAudioStatus> {
+    AUDIO_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// What [`nih_standalone_reconfigure()`] changes: the audio devices, the channels of them the
 /// plugin reads and writes, the sample rate and the period size. The driver stays as it is.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -175,8 +197,11 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
 
     match config.backend {
         config::BackendType::Auto => {
+            // What the last backend that was tried said, for the dummy backend's status
+            let reason = std::cell::RefCell::new(None::<String>);
             let result = backend::Jack::new::<P>(config.clone()).map(|backend| {
                 nih_log!("Using the JACK backend");
+                set_audio_status(StandaloneAudioStatus::Running { backend: "JACK" });
                 run_wrapper::<P, _>(backend, config.clone())
             });
 
@@ -185,6 +210,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                 match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Alsa) {
                     Ok(backend) => {
                         nih_log!("Using the ALSA backend");
+                        set_audio_status(StandaloneAudioStatus::Running { backend: "ALSA" });
                         Ok(run_wrapper::<P, _>(backend, config.clone()))
                     }
                     Err(err) => {
@@ -192,6 +218,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                             "Could not initialize either the JACK or the ALSA backends, falling \
                              back to the dummy audio backend: {err:#}"
                         );
+                        *reason.borrow_mut() = Some(format!("{err:#}"));
                         Err(())
                     }
                 }
@@ -201,6 +228,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                 match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::CoreAudio) {
                     Ok(backend) => {
                         nih_log!("Using the CoreAudio backend");
+                        set_audio_status(StandaloneAudioStatus::Running { backend: "CoreAudio" });
                         Ok(run_wrapper::<P, _>(backend, config.clone()))
                     }
                     Err(err) => {
@@ -208,6 +236,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                             "Could not initialize either the JACK or the CoreAudio backends, \
                              falling back to the dummy audio backend: {err:#}"
                         );
+                        *reason.borrow_mut() = Some(format!("{err:#}"));
                         Err(())
                     }
                 }
@@ -217,6 +246,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                 match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Wasapi) {
                     Ok(backend) => {
                         nih_log!("Using the WASAPI backend");
+                        set_audio_status(StandaloneAudioStatus::Running { backend: "WASAPI" });
                         Ok(run_wrapper::<P, _>(backend, config.clone()))
                     }
                     Err(err) => {
@@ -224,6 +254,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
                             "Could not initialize either the JACK or the WASAPI backends, falling \
                              back to the dummy audio backend: {err:#}"
                         );
+                        *reason.borrow_mut() = Some(format!("{err:#}"));
                         Err(())
                     }
                 }
@@ -231,11 +262,15 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
 
             result.unwrap_or_else(|_| {
                 nih_error!("Falling back to the dummy audio backend, audio and MIDI will not work");
+                set_audio_status(StandaloneAudioStatus::Dummy { reason: reason.take() });
                 run_wrapper::<P, _>(backend::Dummy::new::<P>(config.clone()), config)
             })
         }
         config::BackendType::Jack => match backend::Jack::new::<P>(config.clone()) {
-            Ok(backend) => run_wrapper::<P, _>(backend, config),
+            Ok(backend) => {
+                set_audio_status(StandaloneAudioStatus::Running { backend: "JACK" });
+                run_wrapper::<P, _>(backend, config)
+            }
             Err(err) => {
                 nih_error!("Could not initialize the JACK backend: {:#}", err);
                 false
@@ -244,7 +279,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(target_os = "linux")]
         config::BackendType::Alsa => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Alsa) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    set_audio_status(StandaloneAudioStatus::Running { backend: "ALSA" });
+                    run_wrapper::<P, _>(backend, config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the ALSA backend: {:#}", err);
                     false
@@ -254,7 +292,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(target_os = "macos")]
         config::BackendType::CoreAudio => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::CoreAudio) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    set_audio_status(StandaloneAudioStatus::Running { backend: "CoreAudio" });
+                    run_wrapper::<P, _>(backend, config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the CoreAudio backend: {:#}", err);
                     false
@@ -264,7 +305,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(target_os = "windows")]
         config::BackendType::Wasapi => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Wasapi) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    set_audio_status(StandaloneAudioStatus::Running { backend: "WASAPI" });
+                    run_wrapper::<P, _>(backend, config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the WASAPI backend: {:#}", err);
                     false
@@ -274,7 +318,10 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
         #[cfg(all(target_os = "windows", feature = "asio"))]
         config::BackendType::Asio => {
             match backend::CpalMidir::new::<P>(config.clone(), cpal::HostId::Asio) {
-                Ok(backend) => run_wrapper::<P, _>(backend, config),
+                Ok(backend) => {
+                    set_audio_status(StandaloneAudioStatus::Running { backend: "ASIO" });
+                    run_wrapper::<P, _>(backend, config)
+                }
                 Err(err) => {
                     nih_error!("Could not initialize the ASIO backend: {:#}", err);
                     false
@@ -282,6 +329,7 @@ pub fn nih_export_standalone_with_args<P: Plugin, Args: IntoIterator<Item = Stri
             }
         }
         config::BackendType::Dummy => {
+            set_audio_status(StandaloneAudioStatus::Dummy { reason: None });
             run_wrapper::<P, _>(backend::Dummy::new::<P>(config.clone()), config)
         }
     }
@@ -392,6 +440,38 @@ mod reconfigure_tests {
             assert!(start.elapsed() < Duration::from_secs(10), "timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// The status the host sets when the dummy backend is asked for
+    #[test]
+    fn the_audio_status_says_dummy_for_the_dummy_backend() {
+        let _turn = TEST_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        set_audio_status(StandaloneAudioStatus::Running { backend: "TEST" });
+        assert_eq!(
+            nih_standalone_audio_status(),
+            Some(StandaloneAudioStatus::Running { backend: "TEST" })
+        );
+        STOP.store(false, Ordering::SeqCst);
+        let before = BLOCKS.load(Ordering::SeqCst);
+        let host = std::thread::spawn(|| {
+            nih_export_standalone_with_args::<Counter, _>(
+                ["counter", "--backend", "dummy", "-p", "64"].map(String::from),
+            )
+        });
+        wait_for(|| BLOCKS.load(Ordering::SeqCst) > before + 3);
+        assert_eq!(
+            nih_standalone_audio_status(),
+            Some(StandaloneAudioStatus::Dummy { reason: None })
+        );
+        // The host has no editor, so it blocks until interrupted once the audio has ended: not
+        // joined
+        STOP.store(true, Ordering::SeqCst);
+        wait_for(|| nih_standalone_reconfigure(StandaloneDevices::default()).is_err());
+        drop(host);
+        STOP.store(false, Ordering::SeqCst);
+        // The other test counts from none
+        INITIALIZED.store(0, Ordering::SeqCst);
+        BLOCKS.store(0, Ordering::SeqCst);
     }
 
     /// One test, since the host and the request slot are process-wide
