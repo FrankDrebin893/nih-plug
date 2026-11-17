@@ -434,6 +434,14 @@ mod reconfigure_tests {
 
     use std::num::NonZeroU32;
 
+    /// Nobody takes requests any more: asked, the host says it cannot (not that one is waiting)
+    fn backend_has_stopped() -> bool {
+        matches!(
+            nih_standalone_reconfigure(StandaloneDevices::default()),
+            Err(error) if error.contains("cannot change devices")
+        )
+    }
+
     fn wait_for(what: impl Fn() -> bool) {
         let start = Instant::now();
         while !what() {
@@ -466,12 +474,49 @@ mod reconfigure_tests {
         // The host has no editor, so it blocks until interrupted once the audio has ended: not
         // joined
         STOP.store(true, Ordering::SeqCst);
-        wait_for(|| nih_standalone_reconfigure(StandaloneDevices::default()).is_err());
+        wait_for(backend_has_stopped);
         drop(host);
         STOP.store(false, Ordering::SeqCst);
         // The other test counts from none
         INITIALIZED.store(0, Ordering::SeqCst);
         BLOCKS.store(0, Ordering::SeqCst);
+    }
+
+    /// The `Auto` backend with no audio to open (no JACK server, and an output device that is not
+    /// there) falls back to the dummy backend and says why. A machine that does have a JACK
+    /// server plays on it instead, which is a `Running` status and is left as it is
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_audio_status_says_why_after_the_auto_backend_fell_back() {
+        let _turn = TEST_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        let sentinel = StandaloneAudioStatus::Running { backend: "SENTINEL" };
+        set_audio_status(sentinel.clone());
+        STOP.store(false, Ordering::SeqCst);
+        let host = std::thread::spawn(|| {
+            nih_export_standalone_with_args::<Counter, _>(
+                ["counter", "--output-device", "no such device (hojt-audio#356)"].map(String::from),
+            )
+        });
+        wait_for(|| nih_standalone_audio_status() != Some(sentinel.clone()));
+        match nih_standalone_audio_status() {
+            Some(StandaloneAudioStatus::Dummy { reason }) => {
+                let reason = reason.expect("the fallback carries the error the host logged");
+                assert!(!reason.is_empty());
+                // The host has no editor: it blocks until interrupted once the audio has ended
+                wait_for(|| BLOCKS.load(Ordering::SeqCst) > 3);
+                STOP.store(true, Ordering::SeqCst);
+                wait_for(backend_has_stopped);
+                drop(host);
+                STOP.store(false, Ordering::SeqCst);
+                INITIALIZED.store(0, Ordering::SeqCst);
+                BLOCKS.store(0, Ordering::SeqCst);
+            }
+            Some(StandaloneAudioStatus::Running { .. }) => {
+                // A JACK server here: the host plays on it and cannot be stopped from a test
+                std::mem::forget(host);
+            }
+            None => panic!("the status is set once the backend is chosen"),
+        }
     }
 
     /// One test, since the host and the request slot are process-wide
@@ -524,7 +569,7 @@ mod reconfigure_tests {
         STOP.store(true, Ordering::SeqCst);
         // The audio ends with the plugin's error; a host without an editor then blocks until it
         // is interrupted, so it is not joined. Nobody takes requests any more
-        wait_for(|| nih_standalone_reconfigure(StandaloneDevices::default()).is_err());
+        wait_for(backend_has_stopped);
         drop(host);
     }
 }
